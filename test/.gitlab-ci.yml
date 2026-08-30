@@ -1,0 +1,27 @@
+stages:
+  - build
+  - test
+
+variables:
+  APP_NAME: "hello-world"
+
+build:
+  stage: build
+  image: alpine:3.19
+  script:
+    - echo "Building $APP_NAME..."
+    - echo "build complete"
+
+test:
+  stage: test
+  image: alpine:3.19
+  script:
+    - echo "Running unit tests for $APP_NAME..."
+    - echo "3 tests passed"
+
+lint:
+  stage: test
+  image: alpine:3.19
+  script:
+    - echo "Linting $APP_NAME..."
+    - echo "no issues found"
