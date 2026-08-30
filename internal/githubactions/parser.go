@@ -17,8 +17,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/polyci/polyci/internal/dag"
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/dag"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 // noOpUsesPrefixes are `uses:` actions we don't execute (running arbitrary

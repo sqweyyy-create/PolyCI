@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 // recordingLogger captures step output for assertions instead of printing

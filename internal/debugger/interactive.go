@@ -11,8 +11,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/polyci/polyci/internal/executor"
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/executor"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 // Interactive is an executor.StepController that prompts a human on in/out

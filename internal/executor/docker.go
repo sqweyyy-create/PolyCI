@@ -20,7 +20,7 @@ import (
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 const workDir = "/workspace"

@@ -1,4 +1,4 @@
-module github.com/polyci/polyci
+module github.com/sqweyyy-create/PolyCI
 
 go 1.27.0
 

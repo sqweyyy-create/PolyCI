@@ -8,8 +8,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/polyci/polyci/internal/dag"
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/dag"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 // noOpStepTypes are builtin CircleCI steps we don't implement (no local

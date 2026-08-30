@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/polyci/polyci/internal/circleci"
-	"github.com/polyci/polyci/internal/debugger"
-	"github.com/polyci/polyci/internal/executor"
-	"github.com/polyci/polyci/internal/githubactions"
-	"github.com/polyci/polyci/internal/gitlab"
-	"github.com/polyci/polyci/internal/pipeline"
+	"github.com/sqweyyy-create/PolyCI/internal/circleci"
+	"github.com/sqweyyy-create/PolyCI/internal/debugger"
+	"github.com/sqweyyy-create/PolyCI/internal/executor"
+	"github.com/sqweyyy-create/PolyCI/internal/githubactions"
+	"github.com/sqweyyy-create/PolyCI/internal/gitlab"
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 func main() {
