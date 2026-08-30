@@ -10,6 +10,11 @@ jobs:
       - checkout
       - run: echo "Building $APP_NAME..."
       - run:
+          name: Run the real app.sh from this repo
+          command: |
+            cat src/app.sh
+            sh src/app.sh
+      - run:
           name: Report Node version placeholder
           command: echo "using node $NODE_ENV"
           environment:

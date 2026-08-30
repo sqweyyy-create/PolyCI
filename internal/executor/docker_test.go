@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -204,5 +206,71 @@ func TestControllerContinuePastFailure(t *testing.T) {
 	}
 	if !strings.Contains(log.output.String(), "recovered") {
 		t.Errorf("step after continued-past failure did not run: %q", log.output.String())
+	}
+}
+
+// hostMountableTempDir returns a temp directory under $HOME rather than
+// t.TempDir()'s OS temp dir. Docker engines that run in a VM sharing only
+// $HOME with the host (Colima's default) can't bind-mount paths outside it
+// — see the "Known limitations" note in CLAUDE.md.
+func hostMountableTempDir(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(home, ".polyci-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+// TestWorkspaceMountReadWrite verifies jobs run against real project files
+// on the host (read) and that files a job writes are visible back on the
+// host afterward (write) — the workspace bind mount added to fix the "jobs
+// don't see your repo" limitation noted in CLAUDE.md.
+func TestWorkspaceMountReadWrite(t *testing.T) {
+	hostDir := hostMountableTempDir(t)
+	if err := os.WriteFile(filepath.Join(hostDir, "greeting.txt"), []byte("hello from the host"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &recordingLogger{}
+	d, err := New(log, WithWorkspace(hostDir))
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Stages: []string{"build"},
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Stage: "build",
+				Image: "alpine:3.19",
+				Steps: []pipeline.Step{
+					{Name: "read", Command: "cat greeting.txt"},
+					{Name: "write", Command: "echo 'hello from the container' > from-container.txt"},
+				},
+			},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(log.output.String(), "hello from the host") {
+		t.Errorf("container did not see the host file's real content: %q", log.output.String())
+	}
+
+	written, err := os.ReadFile(filepath.Join(hostDir, "from-container.txt"))
+	if err != nil {
+		t.Fatalf("file written by the container is not visible on the host: %v", err)
+	}
+	if got := strings.TrimSpace(string(written)); got != "hello from the container" {
+		t.Errorf("host-visible file content = %q, want %q", got, "hello from the container")
 	}
 }

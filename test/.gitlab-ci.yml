@@ -10,6 +10,8 @@ build:
   image: alpine:3.19
   script:
     - echo "Building $APP_NAME..."
+    - cat src/app.sh
+    - sh src/app.sh
     - echo "build complete"
 
 test:

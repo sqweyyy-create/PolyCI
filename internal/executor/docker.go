@@ -16,6 +16,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 
@@ -73,9 +74,10 @@ type StepController interface {
 
 // Docker executes pipelines against a Docker Engine.
 type Docker struct {
-	cli  *dockerclient.Client
-	log  Logger
-	ctrl StepController
+	cli       *dockerclient.Client
+	log       Logger
+	ctrl      StepController
+	workspace string
 }
 
 // Option configures optional behavior on a Docker executor.
@@ -85,6 +87,14 @@ type Option func(*Docker)
 // step, whether the pipeline should continue or abort.
 func WithController(c StepController) Option {
 	return func(d *Docker) { d.ctrl = c }
+}
+
+// WithWorkspace overrides the host directory bind-mounted into every job's
+// container at /workspace (read-write). Defaults to the current working
+// directory, matching how a real checkout puts the repo at the job's
+// working directory.
+func WithWorkspace(hostPath string) Option {
+	return func(d *Docker) { d.workspace = hostPath }
 }
 
 // New connects to the local Docker Engine and returns a Docker executor. If
@@ -109,6 +119,13 @@ func New(log Logger, opts ...Option) (*Docker, error) {
 	d := &Docker{cli: cli, log: log}
 	for _, opt := range opts {
 		opt(d)
+	}
+	if d.workspace == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("determine current directory: %w", err)
+		}
+		d.workspace = cwd
 	}
 	return d, nil
 }
@@ -266,9 +283,17 @@ func (d *Docker) createContainer(ctx context.Context, img string, env []string) 
 		Image:      img,
 		Env:        env,
 		WorkingDir: workDir,
-		Cmd:        []string{"sh", "-c", "mkdir -p " + workDir + " && tail -f /dev/null"},
+		Cmd:        []string{"tail", "-f", "/dev/null"},
 		Tty:        false,
-	}, nil, nil, nil, "")
+	}, &container.HostConfig{
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: d.workspace,
+				Target: workDir,
+			},
+		},
+	}, nil, nil, "")
 	if err != nil {
 		return "", err
 	}

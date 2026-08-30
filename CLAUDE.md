@@ -93,17 +93,37 @@ later — a new parser plugs into the same executor and debugger.
   plumbing in `tty_unix.go`/`tty_windows.go`) should be manually
   re-verified against a real Docker container until a reliable
   automated test exists.
-- Neither the GitLab nor the CircleCI executor path checks out or
-  mounts the local repository into the job's container — jobs run
-  against whatever the image already contains, plus /workspace as an
-  empty working directory. CircleCI's `checkout` step (and any other
-  unsupported builtin step: `save_cache`, `restore_cache`,
-  `persist_to_workspace`, `attach_workspace`, `store_artifacts`,
-  `store_test_results`, `setup_remote_docker`, `add_ssh_keys`,
-  `deploy`) is turned into a visible no-op log line rather than erroring,
-  so real-world configs still parse and run, but running a job that
-  actually depends on your project's files being present will not
-  behave like real CI yet.
+- Every job's container gets the current working directory (where
+  `polyci run` was invoked, overridable via `executor.WithWorkspace`
+  for tests) bind-mounted read-write at /workspace, so jobs run
+  against your actual project files, and files a job writes are
+  visible to later jobs and back on the host afterward — this is
+  fixed as of the workspace-mount work; see internal/executor/
+  docker_test.go's TestWorkspaceMountReadWrite. CircleCI's `checkout`
+  step is therefore a no-op (there's no separate clone step to run;
+  your files are already there via the mount). Other unsupported
+  builtin steps (`save_cache`, `restore_cache`, `persist_to_workspace`,
+  `attach_workspace`, `store_artifacts`, `store_test_results`,
+  `setup_remote_docker`, `add_ssh_keys`, `deploy`) still become a
+  visible no-op log line rather than erroring, so real-world configs
+  still parse and run even though those specific behaviors aren't
+  implemented.
+- The workspace bind mount requires the Docker engine to be able to
+  see the host path being mounted. Colima (the default local setup
+  for this project) only shares `$HOME` into its VM by default — a
+  project outside your home directory, or a host path used in a test
+  (see `hostMountableTempDir` in `internal/executor/docker_test.go`,
+  which deliberately avoids `t.TempDir()`'s OS temp dir for this
+  reason), will fail to mount with "bind source path does not exist".
+  If you hit this with a real project, either move it under $HOME or
+  add its path to colima's `mounts:` config
+  (`~/.colima/default/colima.yaml`) and restart colima.
+- Containers run as root by default, so files a job writes into
+  /workspace typically show up on the host owned by root (or by
+  whatever UID the container image defaults to) rather than your own
+  user — a known annoyance shared with other local-CI-runner tools,
+  not yet addressed here (e.g. by matching the container's user to
+  the host UID).
 - Secondary/service containers alongside a job (GitLab's `services:`,
   CircleCI's additional `docker:` entries beyond the first) are not
   started — only the job's primary image runs.
