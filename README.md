@@ -49,17 +49,40 @@ PolyCI is a single Go binary with no runtime dependencies beyond a
 running Docker engine.
 
 **Requirements:**
-- [Go](https://go.dev/) 1.27 or later
 - A running Docker engine reachable from `DOCKER_HOST` or the active
   Docker CLI context — Docker Desktop, [Colima](https://github.com/abiosoft/colima),
   Rancher Desktop, or any other engine that speaks the standard Docker
   API all work
+- [Go](https://go.dev/) 1.27 or later, only if installing via `go install`
+  or building from source
 
-**Build from source:**
+### Install via Homebrew
+
+The recommended way to install on macOS or Linux:
 
 ```sh
-git clone <this repo's URL>
-cd polyci
+brew tap sqweyyy-create/polyci
+brew install polyci
+```
+
+(On newer Homebrew versions, tapping a third-party repository for the
+first time may ask you to run `brew trust sqweyyy-create/polyci`
+before it will install from it.)
+
+### Alternative: `go install`
+
+```sh
+go install github.com/sqweyyy-create/PolyCI/cmd/polyci@latest
+```
+
+This puts `polyci` in `$(go env GOPATH)/bin` — make sure that's on
+your `$PATH`.
+
+### Alternative: build from source
+
+```sh
+git clone https://github.com/sqweyyy-create/PolyCI.git
+cd PolyCI
 go build -o polyci ./cmd/polyci
 ```
 
