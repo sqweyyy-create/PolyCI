@@ -1,0 +1,56 @@
+version: 2
+
+project_name: polyci
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: polyci
+    main: ./cmd/polyci
+    binary: polyci
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: polyci
+    ids:
+      - polyci
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+
+# `brews` (Homebrew Formula generation) is deprecated as of this goreleaser
+# version in favor of `homebrew_casks` — see https://goreleaser.com/deprecations/#brews.
+# This is goreleaser's now-preferred way to distribute precompiled binaries
+# via Homebrew, so we use it here instead of the deprecated section.
+homebrew_casks:
+  - name: polyci
+    binaries: [polyci]
+    repository:
+      owner: sqweyyy-create
+      name: homebrew-polyci
+    directory: Casks
+    homepage: "https://github.com/sqweyyy-create/PolyCI"
+    description: "Run CI/CD pipelines locally in Docker containers, with a debugger, across GitLab CI, CircleCI, and GitHub Actions"
+    license: "MIT"
