@@ -7,19 +7,27 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 // recordingLogger captures step output for assertions instead of printing
-// to a terminal.
+// to a terminal. Safe for concurrent use, since independent jobs now run
+// concurrently and may call it from multiple goroutines at once.
 type recordingLogger struct {
-	mu     sync.Mutex
-	output strings.Builder
-	failed []string
+	mu      sync.Mutex
+	output  strings.Builder
+	failed  []string
+	started []string
+	skipped []string
 }
 
-func (l *recordingLogger) JobStart(jobName, stage, image string) {}
+func (l *recordingLogger) JobStart(jobName, stage, image string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.started = append(l.started, jobName)
+}
 func (l *recordingLogger) StepStart(jobName, stepName, command string) {}
 
 func (l *recordingLogger) StepOutput(jobName, stepName string, chunk []byte) {
@@ -37,6 +45,34 @@ func (l *recordingLogger) StepDone(jobName, stepName string, exitCode int64, err
 }
 
 func (l *recordingLogger) JobDone(jobName string, err error) {}
+
+func (l *recordingLogger) JobSkipped(jobName string, reason error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.skipped = append(l.skipped, jobName)
+}
+
+func (l *recordingLogger) wasStarted(jobName string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, n := range l.started {
+		if n == jobName {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *recordingLogger) wasSkipped(jobName string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, n := range l.skipped {
+		if n == jobName {
+			return true
+		}
+	}
+	return false
+}
 
 func newExecutorOrSkip(t *testing.T, log Logger) *Docker {
 	t.Helper()
@@ -71,6 +107,7 @@ func TestRunSimplePipeline(t *testing.T) {
 				Steps: []pipeline.Step{
 					{Name: "script[0]", Command: "echo $GREETING"},
 				},
+				DependsOn: []string{"build-job"},
 			},
 		},
 	}
@@ -113,6 +150,7 @@ func TestRunStopsOnFailure(t *testing.T) {
 				Steps: []pipeline.Step{
 					{Name: "script[0]", Command: "echo should-not-appear"},
 				},
+				DependsOn: []string{"failing-job"},
 			},
 		},
 	}
@@ -122,6 +160,12 @@ func TestRunStopsOnFailure(t *testing.T) {
 	}
 	if strings.Contains(log.output.String(), "should-not-appear") {
 		t.Errorf("pipeline did not stop after failure: %q", log.output.String())
+	}
+	if log.wasStarted("never-runs") {
+		t.Error("never-runs should have been skipped, not started")
+	}
+	if !log.wasSkipped("never-runs") {
+		t.Error("never-runs should have been reported as skipped")
 	}
 }
 
@@ -310,5 +354,134 @@ func TestAfterScriptRunsOnFailure(t *testing.T) {
 
 	if _, statErr := os.Stat(filepath.Join(hostDir, "after-ran")); statErr != nil {
 		t.Fatalf("after_script did not run despite the script failure (after-ran not found on host): %v", statErr)
+	}
+}
+
+// timingLogger records each job's [start, end) wall-clock window, so a
+// test can prove two jobs actually overlapped in time rather than merely
+// being declared independent by the scheduler.
+type timingLogger struct {
+	mu    sync.Mutex
+	spans map[string][2]time.Time
+}
+
+func newTimingLogger() *timingLogger {
+	return &timingLogger{spans: map[string][2]time.Time{}}
+}
+
+func (l *timingLogger) JobStart(jobName, stage, image string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.spans[jobName]
+	s[0] = time.Now()
+	l.spans[jobName] = s
+}
+func (l *timingLogger) StepStart(jobName, stepName, command string)                  {}
+func (l *timingLogger) StepOutput(jobName, stepName string, chunk []byte)            {}
+func (l *timingLogger) StepDone(jobName, stepName string, exitCode int64, err error) {}
+
+func (l *timingLogger) JobDone(jobName string, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.spans[jobName]
+	s[1] = time.Now()
+	l.spans[jobName] = s
+}
+func (l *timingLogger) JobSkipped(jobName string, reason error) {}
+
+// overlaps reports whether jobs a and b's [start, end) windows intersected
+// — i.e. a started before b ended, and b started before a ended.
+func (l *timingLogger) overlaps(a, b string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	sa, sb := l.spans[a], l.spans[b]
+	return sa[0].Before(sb[1]) && sb[0].Before(sa[1])
+}
+
+// TestDiamondDependencyRunsIndependentJobsConcurrently builds a diamond
+// DAG (A -> B, A -> C, B and C -> D) and proves B and C — which both
+// depend only on A and have no relationship to each other — actually run
+// concurrently, not just that the scheduler treats them as independent.
+// Each sleeps for 2 seconds: if they ran one after another the whole
+// pipeline would take roughly twice as long as if they overlapped, and
+// their real wall-clock [start,end) windows wouldn't intersect.
+func TestDiamondDependencyRunsIndependentJobsConcurrently(t *testing.T) {
+	log := newTimingLogger()
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{Name: "A", Image: "alpine:3.19", Steps: []pipeline.Step{{Name: "s", Command: "echo A"}}},
+			{Name: "B", Image: "alpine:3.19", DependsOn: []string{"A"}, Steps: []pipeline.Step{{Name: "s", Command: "sleep 2"}}},
+			{Name: "C", Image: "alpine:3.19", DependsOn: []string{"A"}, Steps: []pipeline.Step{{Name: "s", Command: "sleep 2"}}},
+			{Name: "D", Image: "alpine:3.19", DependsOn: []string{"B", "C"}, Steps: []pipeline.Step{{Name: "s", Command: "echo D"}}},
+		},
+	}
+
+	start := time.Now()
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Sequential execution would be roughly A + B(2s) + C(2s) + D, north
+	// of 4s of sleeping alone before any Docker overhead. Concurrent
+	// execution should be roughly A + max(B,C)(2s) + D. This ceiling sits
+	// clearly below the sequential total and comfortably above the
+	// concurrent expectation.
+	if elapsed >= 4500*time.Millisecond {
+		t.Errorf("pipeline took %v, too long for B and C (each sleeps 2s) to have run concurrently", elapsed)
+	}
+
+	if !log.overlaps("B", "C") {
+		t.Errorf("B and C did not overlap in wall-clock time: B=%v C=%v", log.spans["B"], log.spans["C"])
+	}
+}
+
+// TestDiamondDependencyFailurePropagation builds the same diamond DAG but
+// with B failing, and proves: D (which depends on both B and C) is
+// skipped without ever starting, while C — B's sibling, sharing only A as
+// a dependency and otherwise unrelated to B — still runs to completion
+// unaffected by B's failure.
+func TestDiamondDependencyFailurePropagation(t *testing.T) {
+	log := &recordingLogger{}
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{Name: "A", Image: "alpine:3.19", Steps: []pipeline.Step{{Name: "s", Command: "echo A"}}},
+			{Name: "B", Image: "alpine:3.19", DependsOn: []string{"A"}, Steps: []pipeline.Step{{Name: "s", Command: "exit 1"}}},
+			{Name: "C", Image: "alpine:3.19", DependsOn: []string{"A"}, Steps: []pipeline.Step{{Name: "s", Command: "echo C ran fine"}}},
+			{Name: "D", Image: "alpine:3.19", DependsOn: []string{"B", "C"}, Steps: []pipeline.Step{{Name: "s", Command: "echo should-not-run"}}},
+		},
+	}
+
+	err := d.Run(context.Background(), p)
+	if err == nil {
+		t.Fatal("Run() = nil, want an error (B failed)")
+	}
+
+	if !log.wasStarted("A") {
+		t.Error("A should have started")
+	}
+	if !log.wasStarted("B") {
+		t.Error("B should have started (and then failed)")
+	}
+	if !log.wasStarted("C") {
+		t.Error("C (B's independent sibling) should have run despite B's failure")
+	}
+	if !strings.Contains(log.output.String(), "C ran fine") {
+		t.Errorf("C's output is missing — sibling branch did not complete: %q", log.output.String())
+	}
+	if log.wasStarted("D") {
+		t.Error("D should have been skipped, not started")
+	}
+	if !log.wasSkipped("D") {
+		t.Error("D should have been reported as skipped")
+	}
+	if strings.Contains(log.output.String(), "should-not-run") {
+		t.Errorf("D's step ran despite being skipped: %q", log.output.String())
 	}
 }

@@ -17,26 +17,26 @@ var defaultStages = []string{".pre", "build", "test", "deploy", ".post"}
 // reservedTopLevelKeys are keywords GitLab recognizes at the top level that
 // are never job definitions.
 var reservedTopLevelKeys = map[string]bool{
-	"stages":          true,
-	"variables":       true,
-	"default":         true,
-	"workflow":        true,
-	"include":         true,
-	"image":           true,
-	"before_script":   true,
-	"after_script":    true,
-	"cache":           true,
-	"services":        true,
-	"timeout":         true,
-	"retry":           true,
-	"tags":            true,
-	"interruptible":   true,
-	"pages":           true,
-	"stages_order":    true,
-	"secrets":         true,
-	"parallel":        true,
-	"trigger":         true,
-	"inherit":         true,
+	"stages":        true,
+	"variables":     true,
+	"default":       true,
+	"workflow":      true,
+	"include":       true,
+	"image":         true,
+	"before_script": true,
+	"after_script":  true,
+	"cache":         true,
+	"services":      true,
+	"timeout":       true,
+	"retry":         true,
+	"tags":          true,
+	"interruptible": true,
+	"pages":         true,
+	"stages_order":  true,
+	"secrets":       true,
+	"parallel":      true,
+	"trigger":       true,
+	"inherit":       true,
 }
 
 // Parse converts raw .gitlab-ci.yml bytes into a provider-agnostic
@@ -197,7 +197,37 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		return nil, fmt.Errorf("no runnable jobs found in config")
 	}
 
+	assignDependsOn(p)
+
 	return p, nil
+}
+
+// assignDependsOn reproduces GitLab's stage-barrier semantics as explicit
+// per-job dependencies: every job depends on every job in the nearest
+// non-empty preceding stage (skipping stages with no jobs in them, exactly
+// as GitLab does), so the executor's dependency-driven scheduler runs
+// stages in order while still running same-stage jobs concurrently.
+func assignDependsOn(p *pipeline.Pipeline) {
+	stageIndex := make(map[string]int, len(p.Stages))
+	for i, s := range p.Stages {
+		stageIndex[s] = i
+	}
+
+	jobNamesByStage := map[int][]string{}
+	for _, j := range p.Jobs {
+		idx := stageIndex[j.Stage]
+		jobNamesByStage[idx] = append(jobNamesByStage[idx], j.Name)
+	}
+
+	for i := range p.Jobs {
+		idx := stageIndex[p.Jobs[i].Stage]
+		for prev := idx - 1; prev >= 0; prev-- {
+			if names, ok := jobNamesByStage[prev]; ok && len(names) > 0 {
+				p.Jobs[i].DependsOn = names
+				break
+			}
+		}
+	}
 }
 
 // decodeMap decodes a yaml mapping node into a map[string]interface{}.

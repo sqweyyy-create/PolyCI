@@ -3,32 +3,31 @@
 // debugger are written once and reused across providers.
 package pipeline
 
-// Pipeline is a full CI run: an ordered list of stages and the jobs that
-// belong to them.
+// Pipeline is a full CI run: an ordered list of stages (informational —
+// see Job.Stage) and the jobs that belong to them.
 type Pipeline struct {
 	Stages []string
 	Jobs   []Job
 }
 
-// JobsInStage returns the jobs belonging to the given stage, in the order
-// they were defined in the source config.
-func (p *Pipeline) JobsInStage(stage string) []Job {
-	var jobs []Job
-	for _, j := range p.Jobs {
-		if j.Stage == stage {
-			jobs = append(jobs, j)
-		}
-	}
-	return jobs
-}
-
 // Job is a single unit of work: run in one container, made of ordered steps.
+// Stage is an informational label (shown in logs); actual run order and
+// concurrency are driven entirely by DependsOn.
 type Job struct {
 	Name      string
 	Stage     string
 	Image     string
 	Variables map[string]string
 	Steps     []Step
+	// DependsOn lists the names of other jobs in the same Pipeline that
+	// must reach a terminal state (success, failure, or skip) before this
+	// job may start. A job runs only if every dependency succeeded; if any
+	// failed or was itself skipped, this job is skipped too. Jobs with no
+	// common dependency relationship may run concurrently. For GitLab,
+	// this is every job in the nearest non-empty preceding stage
+	// (reproducing GitLab's stage-barrier semantics); for CircleCI and
+	// GitHub Actions, it's the resolved requires:/needs: list.
+	DependsOn []string
 }
 
 // Phase marks which part of a job a step belongs to, so the executor knows

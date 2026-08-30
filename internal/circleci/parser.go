@@ -103,6 +103,11 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			p.Stages = append(p.Stages, fmt.Sprintf("%s/level-%d", wfName, lvl))
 		}
 
+		requiresByName := make(map[string][]string, len(refs))
+		for _, r := range refs {
+			requiresByName[r.name] = r.requires
+		}
+
 		for _, jobName := range order {
 			def, ok := jobDefs[jobName]
 			if !ok {
@@ -114,6 +119,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 				Image:     def.image,
 				Variables: def.env,
 				Steps:     def.steps,
+				DependsOn: requiresByName[jobName],
 			})
 		}
 	}

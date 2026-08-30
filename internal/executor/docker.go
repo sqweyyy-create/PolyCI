@@ -12,6 +12,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -25,8 +28,11 @@ import (
 
 const workDir = "/workspace"
 
-// Logger receives streamed pipeline output. Both methods are called
-// synchronously from the goroutine running the pipeline.
+// Logger receives streamed pipeline output. Independent jobs run
+// concurrently, so its methods may be called from multiple goroutines at
+// once for different jobs — implementations must be safe for concurrent
+// use. Calls for any single job are still made in order and never overlap
+// with each other.
 type Logger interface {
 	// JobStart is called before a job's first step runs.
 	JobStart(jobName, stage, image string)
@@ -36,8 +42,13 @@ type Logger interface {
 	StepOutput(jobName, stepName string, chunk []byte)
 	// StepDone is called after a step finishes.
 	StepDone(jobName, stepName string, exitCode int64, err error)
-	// JobDone is called after a job's steps finish (or one failed).
+	// JobDone is called after a job's steps finish (or one failed). Not
+	// called for a job that was skipped — see JobSkipped.
 	JobDone(jobName string, err error)
+	// JobSkipped is called instead of JobStart/JobDone for a job that
+	// never ran because a dependency it needed failed or was itself
+	// skipped. reason explains why.
+	JobSkipped(jobName string, reason error)
 }
 
 // Decision is the debugger's answer to whether the pipeline should keep
@@ -78,6 +89,12 @@ type Docker struct {
 	log       Logger
 	ctrl      StepController
 	workspace string
+	// ctrlMu serializes StepController interactions (which may prompt on
+	// a shared terminal, or hand over the terminal entirely for a shell)
+	// across concurrently running jobs, so two jobs' debug prompts or
+	// shells can never interleave. It does not limit concurrency of the
+	// underlying Docker work itself.
+	ctrlMu sync.Mutex
 }
 
 // Option configures optional behavior on a Docker executor.
@@ -184,18 +201,125 @@ func activeContextDockerHost() (string, error) {
 	return meta.Endpoints.Docker.Host, nil
 }
 
-// Run executes every stage of the pipeline in order; within a stage, jobs
-// run sequentially in the order they were defined. Execution stops at the
-// first failing job.
+// jobState tracks one job's progress through Run's scheduler.
+type jobState int
+
+const (
+	statePending jobState = iota
+	stateRunning
+	stateSuccess
+	stateFailed
+	stateSkipped
+)
+
+// Run executes the pipeline's jobs according to their DependsOn edges:
+// every job starts as soon as all of its dependencies have finished
+// successfully, so independent jobs (and jobs whose shared dependencies
+// have already succeeded) run concurrently rather than waiting on each
+// other. If a job fails or is skipped, everything that depends on it
+// (directly or transitively) is skipped rather than run — but that only
+// affects that job's own dependents; independent branches of the DAG are
+// unaffected and still run to completion. Run itself always waits for
+// every job to reach a terminal state before returning, so one branch
+// failing early never cuts a sibling branch short.
 func (d *Docker) Run(ctx context.Context, p *pipeline.Pipeline) error {
-	for _, stage := range p.Stages {
-		for _, job := range p.JobsInStage(stage) {
-			if err := d.runJob(ctx, job); err != nil {
-				return fmt.Errorf("job %q failed: %w", job.Name, err)
+	if len(p.Jobs) == 0 {
+		return nil
+	}
+
+	jobsByName := make(map[string]pipeline.Job, len(p.Jobs))
+	for _, j := range p.Jobs {
+		if _, dup := jobsByName[j.Name]; dup {
+			return fmt.Errorf("duplicate job name %q in pipeline", j.Name)
+		}
+		jobsByName[j.Name] = j
+	}
+	for _, j := range p.Jobs {
+		for _, dep := range j.DependsOn {
+			if _, ok := jobsByName[dep]; !ok {
+				return fmt.Errorf("job %q depends on unknown job %q", j.Name, dep)
 			}
 		}
 	}
-	return nil
+
+	var mu sync.Mutex
+	states := make(map[string]jobState, len(p.Jobs))
+	errs := make(map[string]error, len(p.Jobs))
+	done := make(map[string]chan struct{}, len(p.Jobs))
+	for _, j := range p.Jobs {
+		states[j.Name] = statePending
+		done[j.Name] = make(chan struct{})
+	}
+
+	setState := func(name string, s jobState, err error) {
+		mu.Lock()
+		states[name] = s
+		if err != nil {
+			errs[name] = err
+		}
+		mu.Unlock()
+	}
+	getState := func(name string) jobState {
+		mu.Lock()
+		defer mu.Unlock()
+		return states[name]
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(p.Jobs))
+	for _, j := range p.Jobs {
+		job := j
+		go func() {
+			defer wg.Done()
+			defer close(done[job.Name])
+
+			var blockedOn string
+			for _, dep := range job.DependsOn {
+				<-done[dep]
+				if s := getState(dep); s == stateFailed || s == stateSkipped {
+					if blockedOn == "" {
+						blockedOn = dep
+					}
+				}
+			}
+
+			if blockedOn != "" {
+				err := fmt.Errorf("skipped: dependency %q did not succeed", blockedOn)
+				setState(job.Name, stateSkipped, err)
+				d.log.JobSkipped(job.Name, err)
+				return
+			}
+
+			setState(job.Name, stateRunning, nil)
+			if err := d.runJob(ctx, job); err != nil {
+				setState(job.Name, stateFailed, err)
+			} else {
+				setState(job.Name, stateSuccess, nil)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var failedNames []string
+	mu.Lock()
+	for name, s := range states {
+		if s == stateFailed {
+			failedNames = append(failedNames, name)
+		}
+	}
+	mu.Unlock()
+	if len(failedNames) == 0 {
+		return nil
+	}
+	sort.Strings(failedNames)
+
+	mu.Lock()
+	firstErr := errs[failedNames[0]]
+	mu.Unlock()
+	if len(failedNames) == 1 {
+		return fmt.Errorf("job %q failed: %w", failedNames[0], firstErr)
+	}
+	return fmt.Errorf("jobs failed: %s (first: %w)", strings.Join(failedNames, ", "), firstErr)
 }
 
 func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
@@ -294,7 +418,10 @@ func (d *Docker) runSteps(ctx context.Context, containerID, jobName string, step
 
 		if d.ctrl != nil {
 			shellFn := func(ctx context.Context) error { return d.Shell(ctx, containerID) }
-			if d.ctrl.AfterStep(ctx, jobName, step, exitCode, stepErr, shellFn) == Abort {
+			d.ctrlMu.Lock()
+			decision := d.ctrl.AfterStep(ctx, jobName, step, exitCode, stepErr, shellFn)
+			d.ctrlMu.Unlock()
+			if decision == Abort {
 				err := ErrAborted
 				if failed {
 					err = failure()

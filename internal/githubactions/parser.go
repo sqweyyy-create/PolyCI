@@ -66,6 +66,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 
 	var nodes []dag.Node
 	defs := map[string]jobDef{}
+	needsByName := map[string][]string{}
 	for i := 0; i+1 < len(jobsNode.Content); i += 2 {
 		name := jobsNode.Content[i].Value
 		def, needs, err := parseJob(jobsNode.Content[i+1], globalEnv)
@@ -73,6 +74,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			return nil, fmt.Errorf("job %q: %w", name, err)
 		}
 		defs[name] = def
+		needsByName[name] = needs
 		nodes = append(nodes, dag.Node{Name: name, Depends: needs})
 	}
 
@@ -100,6 +102,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			Image:     def.image,
 			Variables: def.env,
 			Steps:     def.steps,
+			DependsOn: needsByName[name],
 		})
 	}
 
