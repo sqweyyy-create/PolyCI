@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -51,15 +52,23 @@ const (
 	Abort
 )
 
-// ErrAborted is returned by Run/runJob when a StepController returns Abort.
+// ErrAborted is returned by Run/runJob when a StepController returns Abort
+// for a step that had itself succeeded (an unprompted failure instead
+// surfaces its own, more specific error).
 var ErrAborted = fmt.Errorf("pipeline aborted by user")
 
+// ShellFunc drops the caller into an interactive shell inside the
+// container a step just ran in, wiring the real terminal's stdin/stdout to
+// it. It blocks until the user exits the shell.
+type ShellFunc func(ctx context.Context) error
+
 // StepController is consulted after every step finishes, letting a
-// debugger layer pause the pipeline and let the user decide whether to
-// continue or abort. When nil, the executor runs straight through and
-// stops automatically at the first failing step (Phase 1 behavior).
+// debugger layer pause the pipeline, offer an interactive shell in the
+// step's own container, and decide whether to continue or abort. When
+// nil, the executor runs straight through and stops automatically at the
+// first failing step (Phase 1 behavior).
 type StepController interface {
-	AfterStep(jobName string, step pipeline.Step, exitCode int64, stepErr error) Decision
+	AfterStep(ctx context.Context, jobName string, step pipeline.Step, exitCode int64, stepErr error, shell ShellFunc) Decision
 }
 
 // Docker executes pipelines against a Docker Engine.
@@ -206,21 +215,29 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 		d.log.StepDone(job.Name, step.Name, exitCode, stepErr)
 
 		failed := stepErr != nil || exitCode != 0
+		failure := func() error {
+			if stepErr != nil {
+				return stepErr
+			}
+			return fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
+		}
 
 		if d.ctrl != nil {
-			if d.ctrl.AfterStep(job.Name, step, exitCode, stepErr) == Abort {
-				d.log.JobDone(job.Name, ErrAborted)
-				return ErrAborted
+			shellFn := func(ctx context.Context) error { return d.Shell(ctx, containerID) }
+			if d.ctrl.AfterStep(ctx, job.Name, step, exitCode, stepErr, shellFn) == Abort {
+				err := ErrAborted
+				if failed {
+					err = failure()
+				}
+				d.log.JobDone(job.Name, err)
+				return err
 			}
 			if failed {
 				// The debugger let the user override the failure; move on.
 				continue
 			}
 		} else if failed {
-			err := stepErr
-			if err == nil {
-				err = fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
-			}
+			err := failure()
 			d.log.JobDone(job.Name, err)
 			return err
 		}
@@ -291,6 +308,59 @@ func (d *Docker) execStep(ctx context.Context, containerID, jobName string, step
 		return -1, fmt.Errorf("exec inspect: %w", err)
 	}
 	return int64(inspect.ExitCode), nil
+}
+
+// Shell drops the caller into an interactive shell inside the given
+// container, wiring os.Stdin/os.Stdout to it over a Docker exec TTY. It
+// prefers bash if the image has it, falling back to sh, and blocks until
+// the shell exits.
+func (d *Docker) Shell(ctx context.Context, containerID string) error {
+	execResp, err := d.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+		Cmd:          []string{"sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"},
+		WorkingDir:   workDir,
+		Tty:          true,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return fmt.Errorf("exec create: %w", err)
+	}
+
+	attach, err := d.cli.ContainerExecAttach(ctx, execResp.ID, container.ExecAttachOptions{Tty: true})
+	if err != nil {
+		return fmt.Errorf("exec attach: %w", err)
+	}
+	defer attach.Close()
+
+	restore := makeRawAndResize(ctx, d.cli, execResp.ID)
+	defer restore()
+
+	copyDone := make(chan struct{})
+	go func() {
+		io.Copy(attach.Conn, os.Stdin)
+		// Local stdin closed (or hit EOF): tell the container's exec so a
+		// shell reading non-interactively can exit instead of hanging.
+		attach.CloseWrite()
+		close(copyDone)
+	}()
+	io.Copy(os.Stdout, attach.Reader)
+
+	select {
+	case <-copyDone:
+	case <-time.After(200 * time.Millisecond):
+		// Stdin is likely still blocked on a read with no more input
+		// coming; don't hang the pipeline waiting for it.
+	}
+
+	inspect, err := d.cli.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("exec inspect: %w", err)
+	}
+	if inspect.ExitCode != 0 {
+		return fmt.Errorf("shell exited with code %d", inspect.ExitCode)
+	}
+	return nil
 }
 
 // lineWriter forwards each Write call's bytes to write, unmodified — it

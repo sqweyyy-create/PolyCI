@@ -130,7 +130,7 @@ type scriptedController struct {
 	calls     []string
 }
 
-func (c *scriptedController) AfterStep(jobName string, step pipeline.Step, exitCode int64, stepErr error) Decision {
+func (c *scriptedController) AfterStep(ctx context.Context, jobName string, step pipeline.Step, exitCode int64, stepErr error, shell ShellFunc) Decision {
 	c.calls = append(c.calls, jobName+"/"+step.Name)
 	d := c.decisions[0]
 	c.decisions = c.decisions[1:]

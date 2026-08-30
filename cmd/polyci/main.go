@@ -37,13 +37,14 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: polyci run [-f .gitlab-ci.yml] [-debug]")
+	fmt.Fprintln(os.Stderr, "Usage: polyci run [-f .gitlab-ci.yml] [-debug] [-shell-on-fail]")
 }
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	file := fs.String("f", ".gitlab-ci.yml", "path to the CI config file")
 	debug := fs.Bool("debug", false, "pause after each step and ask whether to continue or abort")
+	shellOnFail := fs.Bool("shell-on-fail", false, "on a failing step, drop into an interactive shell in its container")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,8 +62,11 @@ func runCmd(args []string) error {
 	log := newTermLogger(os.Stdout)
 
 	var opts []executor.Option
-	if *debug {
-		opts = append(opts, executor.WithController(debugger.NewInteractive(os.Stdin, os.Stdout)))
+	if *debug || *shellOnFail {
+		ctrl := debugger.NewInteractive(os.Stdin, os.Stdout)
+		ctrl.StepByStep = *debug
+		ctrl.ShellOnFail = *shellOnFail
+		opts = append(opts, executor.WithController(ctrl))
 	}
 
 	docker, err := executor.New(log, opts...)

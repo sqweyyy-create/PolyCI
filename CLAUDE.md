@@ -80,3 +80,16 @@ later — a new parser plugs into the same executor and debugger.
 - Tests must NEVER depend on a real remote CI service or push to a
   real repository — they run against local fixture YAML files and a
   local Docker daemon only.
+
+## Known limitations
+
+- Phase 3's shell-on-fail feature (dropping the user into an
+  interactive shell in the failing container) is verified manually
+  with a real TTY, not by an automated test. An automated Go test
+  driving it over a pseudo-terminal (`github.com/creack/pty`) was
+  attempted but hung unreliably, so it was removed rather than left
+  flaky in the suite. Future changes to the attach/shell logic in
+  `internal/executor/docker.go` (the `Shell` method and its TTY
+  plumbing in `tty_unix.go`/`tty_windows.go`) should be manually
+  re-verified against a real Docker container until a reliable
+  automated test exists.
