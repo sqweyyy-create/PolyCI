@@ -1,3 +1,13 @@
+# Built binary
 /polyci
 /dist/
+
+# Go test artifacts
 *.test
+coverage.out
+
+# Local artifacts jobs may write into the mounted workspace when running
+# the example configs under test/ (see the "Known limitations" note in
+# CLAUDE.md about root-owned output files).
+/test/dist/
+/test/*.local
