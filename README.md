@@ -1,23 +1,26 @@
 # PolyCI
 
-PolyCI is a CLI tool that runs CI/CD pipelines locally in Docker
-containers, with a built-in step-by-step debugger, across multiple CI
-providers — starting where no good local tool currently exists.
+PolyCI is a local debugger for CI pipelines. Instead of editing a
+script, pushing, and waiting for a remote runner to fail again, you
+run the failing job on your own machine, pause it step-by-step, and
+drop into a real shell inside the exact container where it broke — no
+separate debug action, no guesswork about what the runner's
+environment looked like.
 
-It parses your existing `.gitlab-ci.yml`, CircleCI `config.yml`, or
-GitHub Actions workflow file, converts it into one internal
-provider-agnostic pipeline model (jobs → steps), and runs it against
-your local Docker engine, streaming logs to the terminal exactly the
-way real CI would.
+It works across GitLab CI, CircleCI, and GitHub Actions: it parses
+your existing `.gitlab-ci.yml`, CircleCI `config.yml`, or GitHub
+Actions workflow file, converts it into one internal provider-agnostic
+pipeline model (jobs → steps), and runs it against your local Docker
+engine, streaming logs to the terminal exactly the way real CI would.
 
 ## Why this project exists
 
-GitLab CI and CircleCI have no equivalent of GitHub's `act` — there is
-currently no good way to run their pipelines locally before pushing.
-PolyCI fills that gap, and adds something no local runner (including
-`act`) currently has: a step-by-step debugger and an interactive
-on-failure shell, built in rather than bolted on as a separate
-action.
+No local CI tool — including `act` — ships a built-in step-by-step
+debugger or an interactive on-failure shell. That's the actual gap
+PolyCI fills. Building it properly meant not tying the debugger to one
+provider's format, which turned out to close a second gap for free:
+GitLab CI and CircleCI have no local runner at all today, `act`-style
+or otherwise, so PolyCI covers those too.
 
 ## Relationship to `act`
 
@@ -27,21 +30,22 @@ integrations. **PolyCI is not trying to replace or out-compete `act`
 on GitHub Actions** — it already does that job well, and duplicating
 it isn't where this project adds value.
 
-PolyCI's actual differentiators are:
+PolyCI's actual differentiator is the debugger:
 
-1. **GitLab CI and CircleCI support**, where no equivalent local
-   runner exists at all today — that's where this project starts and
-   where most of its value is.
-2. **A built-in step-by-step debugger and shell-on-fail** (pause after
+1. **A built-in step-by-step debugger and shell-on-fail** (pause after
    every step, choose continue/abort, or drop into a real shell inside
    the failing container) — a genuine gap even for GitHub Actions
-   users of `act`, and available for all three providers here.
+   users of `act`, and the reason this project exists.
+2. It happens to also cover **GitLab CI and CircleCI**, where no
+   equivalent local runner exists at all otherwise — a side effect of
+   building the debugger on a provider-agnostic engine rather than a
+   consequence of targeting those providers specifically.
 3. **One tool for repos that use more than one CI provider**, instead
    of juggling a separate local runner per provider.
 
-The GitHub Actions parser exists mainly to serve that third point —
-if you only use GitHub Actions, `act` remains the better-supported
-choice.
+If you only use GitHub Actions and don't need step-by-step debugging
+or shell-on-fail, `act` remains the more mature, better-supported
+choice on its own.
 
 ## Installation
 
@@ -93,47 +97,15 @@ run it from anywhere.
 ## Usage
 
 Run `polyci run` from the root of the project whose pipeline you want
-to test — the current directory is bind-mounted read-write into every
-job's container at `/workspace`, so jobs see your actual files, the
-same way a real CI checkout would.
+to debug or test — the current directory is bind-mounted read-write
+into every job's container at `/workspace`, so jobs see your actual
+files, the same way a real CI checkout would.
 
-### GitLab CI
+### Debugging
 
-```sh
-# Looks for .gitlab-ci.yml in the current directory by default
-polyci run
-
-# Or point at a specific file
-polyci run -provider gitlab -f path/to/.gitlab-ci.yml
-```
-
-### CircleCI
-
-```sh
-# Looks for .circleci/config.yml in the current directory by default
-polyci run -provider circleci
-
-# Or point at a specific file
-polyci run -provider circleci -f path/to/config.yml
-```
-
-### GitHub Actions
-
-Workflow files can be named anything under `.github/workflows/`, so
-there's no sensible default — `-f` is required:
-
-```sh
-polyci run -provider github-actions -f .github/workflows/ci.yml
-```
-
-Only jobs with an explicit `container:` are runnable (see
-[Known Limitations](#known-limitations)).
-
-### Debug mode
-
-Add `-debug` to any of the above to pause after every step, see its
-result, and choose whether to continue or abort — or drop into a
-manual shell in the job's container by answering `s`:
+Add `-debug` to pause after every step, see its result, and choose
+whether to continue or abort — or drop into a manual shell in the
+job's container by answering `s`:
 
 ```sh
 polyci run -debug
@@ -155,6 +127,42 @@ polyci run -shell-on-fail
 
 Both flags can be combined: shell on failure, then still get asked to
 continue or abort once you exit the shell.
+
+### Running a pipeline
+
+The same `polyci run` works across all three providers:
+
+**GitLab CI:**
+
+```sh
+# Looks for .gitlab-ci.yml in the current directory by default
+polyci run
+
+# Or point at a specific file
+polyci run -provider gitlab -f path/to/.gitlab-ci.yml
+```
+
+**CircleCI:**
+
+```sh
+# Looks for .circleci/config.yml in the current directory by default
+polyci run -provider circleci
+
+# Or point at a specific file
+polyci run -provider circleci -f path/to/config.yml
+```
+
+**GitHub Actions:**
+
+Workflow files can be named anything under `.github/workflows/`, so
+there's no sensible default — `-f` is required:
+
+```sh
+polyci run -provider github-actions -f .github/workflows/ci.yml
+```
+
+Only jobs with an explicit `container:` are runnable (see
+[Known Limitations](#known-limitations)).
 
 ## Known Limitations
 
