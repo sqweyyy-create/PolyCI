@@ -59,6 +59,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 	globalVariables := map[string]string{}
 	var defaultImage, topLevelImage string
 	var defaultBefore, defaultAfter, topBefore, topAfter []string
+	var topServices []pipeline.Service
 
 	// First pass: pick up stage list and defaults, which job resolution
 	// depends on, regardless of where they appear in the file.
@@ -99,6 +100,12 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			topBefore = toStringSlice(nodeToInterface(val))
 		case "after_script":
 			topAfter = toStringSlice(nodeToInterface(val))
+		case "services":
+			services, err := parseServices(nodeToInterface(val))
+			if err != nil {
+				return nil, fmt.Errorf("services: %w", err)
+			}
+			topServices = services
 		}
 	}
 
@@ -173,6 +180,15 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			}
 		}
 
+		services := topServices
+		if sv, ok := raw["services"]; ok {
+			svcs, err := parseServices(sv)
+			if err != nil {
+				return nil, fmt.Errorf("job %q: services: %w", key, err)
+			}
+			services = svcs
+		}
+
 		var steps []pipeline.Step
 		for idx, cmd := range before {
 			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("before_script[%d]", idx), Command: cmd, Phase: pipeline.PhaseMain})
@@ -190,6 +206,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			Image:     image,
 			Variables: jobVars,
 			Steps:     steps,
+			Services:  services,
 		})
 	}
 
@@ -302,6 +319,41 @@ func toStringSlice(v interface{}) []string {
 		return out
 	}
 	return nil
+}
+
+// parseServices converts an already-decoded `services:` value (a list of
+// either bare image strings, or maps with name:/alias:/variables:) into
+// pipeline.Services. Each entry's alias defaults to
+// pipeline.DefaultServiceAlias(image) when not given explicitly.
+func parseServices(v interface{}) ([]pipeline.Service, error) {
+	list, ok := v.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("must be a list")
+	}
+	var services []pipeline.Service
+	for i, item := range list {
+		switch t := item.(type) {
+		case string:
+			services = append(services, pipeline.Service{Image: t, Alias: pipeline.DefaultServiceAlias(t)})
+		case map[string]interface{}:
+			img, _ := t["name"].(string)
+			if img == "" {
+				return nil, fmt.Errorf("[%d]: missing name", i)
+			}
+			alias, _ := t["alias"].(string)
+			if alias == "" {
+				alias = pipeline.DefaultServiceAlias(img)
+			}
+			services = append(services, pipeline.Service{
+				Image:     img,
+				Alias:     alias,
+				Variables: toStringMap(t["variables"]),
+			})
+		default:
+			return nil, fmt.Errorf("[%d]: unsupported format", i)
+		}
+	}
+	return services, nil
 }
 
 func contains(list []string, s string) bool {

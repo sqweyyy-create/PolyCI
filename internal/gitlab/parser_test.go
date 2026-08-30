@@ -122,3 +122,44 @@ job1:
 		t.Errorf("default Stages = %v, want 5 default stages", p.Stages)
 	}
 }
+
+func TestParseServicesTopLevelAndPerJob(t *testing.T) {
+	data := []byte(`
+services:
+  - postgres:15
+
+job1:
+  image: alpine
+  script: [echo hi]
+
+job2:
+  image: alpine
+  script: [echo hi]
+  services:
+    - name: redis:7
+      alias: cache
+      variables:
+        REDIS_PASSWORD: secret
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Jobs) != 2 {
+		t.Fatalf("got %d jobs, want 2", len(p.Jobs))
+	}
+
+	job1 := p.Jobs[0]
+	if len(job1.Services) != 1 || job1.Services[0].Image != "postgres:15" || job1.Services[0].Alias != "postgres" {
+		t.Errorf("job1 (top-level default services) = %+v", job1.Services)
+	}
+
+	job2 := p.Jobs[1]
+	if len(job2.Services) != 1 {
+		t.Fatalf("job2 services = %+v, want 1 (job-level overrides top-level, doesn't merge)", job2.Services)
+	}
+	svc := job2.Services[0]
+	if svc.Image != "redis:7" || svc.Alias != "cache" || svc.Variables["REDIS_PASSWORD"] != "secret" {
+		t.Errorf("job2 service = %+v", svc)
+	}
+}

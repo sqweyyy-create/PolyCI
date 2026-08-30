@@ -3,6 +3,8 @@
 // debugger are written once and reused across providers.
 package pipeline
 
+import "strings"
+
 // Pipeline is a full CI run: an ordered list of stages (informational —
 // see Job.Stage) and the jobs that belong to them.
 type Pipeline struct {
@@ -28,6 +30,38 @@ type Job struct {
 	// (reproducing GitLab's stage-barrier semantics); for CircleCI and
 	// GitHub Actions, it's the resolved requires:/needs: list.
 	DependsOn []string
+	// Services are additional containers started alongside the job's own
+	// container for its duration, reachable from it by their Alias (e.g.
+	// GitLab's services:, or CircleCI's docker: entries after the first).
+	Services []Service
+}
+
+// Service is a secondary container started alongside a job's own
+// container, on a network shared with it, so the job can reach it by
+// hostname (Alias) — e.g. a database the job's tests connect to.
+type Service struct {
+	Image     string
+	Alias     string
+	Variables map[string]string
+}
+
+// DefaultServiceAlias derives the hostname a service is reachable by when
+// no explicit alias is configured, following the same convention GitLab
+// and CircleCI both use: the image name without its registry path or
+// tag/digest. "postgres:15" and "docker.io/library/postgres:15" both give
+// "postgres".
+func DefaultServiceAlias(image string) string {
+	name := image
+	if i := strings.LastIndex(name, "/"); i != -1 {
+		name = name[i+1:]
+	}
+	if i := strings.LastIndex(name, "@"); i != -1 {
+		name = name[:i]
+	}
+	if i := strings.LastIndex(name, ":"); i != -1 {
+		name = name[:i]
+	}
+	return name
 }
 
 // Phase marks which part of a job a step belongs to, so the executor knows

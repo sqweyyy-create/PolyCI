@@ -206,3 +206,36 @@ func TestDependencyLevelsFanOutFanIn(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSecondaryDockerImagesBecomeServices(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    docker:
+      - image: cimg/base:2023.03
+      - image: postgres:15
+      - image: redis:7
+        name: cache
+        environment:
+          REDIS_PASSWORD: secret
+    steps:
+      - run: echo hi
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Jobs[0].Image != "cimg/base:2023.03" {
+		t.Errorf("Image = %q, want cimg/base:2023.03 (first docker: entry)", p.Jobs[0].Image)
+	}
+	services := p.Jobs[0].Services
+	if len(services) != 2 {
+		t.Fatalf("got %d services, want 2: %+v", len(services), services)
+	}
+	if services[0].Image != "postgres:15" || services[0].Alias != "postgres" {
+		t.Errorf("services[0] = %+v, want image postgres:15 with default alias postgres", services[0])
+	}
+	if services[1].Image != "redis:7" || services[1].Alias != "cache" || services[1].Variables["REDIS_PASSWORD"] != "secret" {
+		t.Errorf("services[1] = %+v", services[1])
+	}
+}

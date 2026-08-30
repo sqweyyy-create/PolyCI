@@ -5,6 +5,7 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/network"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 
@@ -337,18 +339,71 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 		return err
 	}
 
+	// cleanups runs in reverse (LIFO) order once the job finishes,
+	// regardless of success or failure — so the job's own container is
+	// always removed first, then each service container, then finally the
+	// network they shared (Docker requires a network's containers to be
+	// gone before the network itself can be removed).
+	var cleanups []func()
+	defer func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}()
+
+	var networkName string
+	if len(job.Services) > 0 {
+		for _, svc := range job.Services {
+			if err := d.ensureImage(ctx, svc.Image); err != nil {
+				err = fmt.Errorf("pull service image %q: %w", svc.Image, err)
+				d.log.JobDone(job.Name, err)
+				return err
+			}
+		}
+
+		name, err := d.createNetwork(ctx)
+		if err != nil {
+			err = fmt.Errorf("create service network: %w", err)
+			d.log.JobDone(job.Name, err)
+			return err
+		}
+		networkName = name
+		cleanups = append(cleanups, func() { d.removeNetwork(context.Background(), name) })
+
+		for _, svc := range job.Services {
+			svcEnv := make([]string, 0, len(svc.Variables))
+			for k, v := range svc.Variables {
+				svcEnv = append(svcEnv, k+"="+v)
+			}
+
+			svcContainerID, err := d.createServiceContainer(ctx, svc.Image, svcEnv, networkName, svc.Alias)
+			if err != nil {
+				err = fmt.Errorf("create service %q (%s): %w", svc.Alias, svc.Image, err)
+				d.log.JobDone(job.Name, err)
+				return err
+			}
+			cleanups = append(cleanups, func() { d.removeContainer(context.Background(), svcContainerID) })
+
+			if err := d.cli.ContainerStart(ctx, svcContainerID, container.StartOptions{}); err != nil {
+				err = fmt.Errorf("start service %q (%s): %w", svc.Alias, svc.Image, err)
+				d.log.JobDone(job.Name, err)
+				return err
+			}
+		}
+	}
+
 	env := make([]string, 0, len(job.Variables))
 	for k, v := range job.Variables {
 		env = append(env, k+"="+v)
 	}
 
-	containerID, err := d.createContainer(ctx, job.Image, env)
+	containerID, err := d.createContainer(ctx, job.Image, env, networkName)
 	if err != nil {
 		err = fmt.Errorf("create container: %w", err)
 		d.log.JobDone(job.Name, err)
 		return err
 	}
-	defer d.removeContainer(context.Background(), containerID)
+	cleanups = append(cleanups, func() { d.removeContainer(context.Background(), containerID) })
 
 	if err := d.cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		err = fmt.Errorf("start container: %w", err)
@@ -475,7 +530,12 @@ func (d *Docker) ensureImage(ctx context.Context, ref string) error {
 	return err
 }
 
-func (d *Docker) createContainer(ctx context.Context, img string, env []string) (string, error) {
+// createContainer creates the job's own container: an idle "tail -f
+// /dev/null" process ready for exec, with the workspace mounted. When
+// networkName is non-empty (the job has services), it's attached to that
+// network too, so it can reach each service by its alias via Docker's
+// embedded DNS.
+func (d *Docker) createContainer(ctx context.Context, img string, env []string, networkName string) (string, error) {
 	resp, err := d.cli.ContainerCreate(ctx, &container.Config{
 		Image:      img,
 		Env:        env,
@@ -490,15 +550,69 @@ func (d *Docker) createContainer(ctx context.Context, img string, env []string) 
 				Target: workDir,
 			},
 		},
-	}, nil, nil, "")
+	}, serviceNetworkConfig(networkName, ""), nil, "")
 	if err != nil {
 		return "", err
 	}
 	return resp.ID, nil
 }
 
+// createServiceContainer creates a service container running its image's
+// own default command (a database server, for example — unlike the job's
+// own container, nothing here overrides it to stay idle), attached to
+// networkName under the given alias so the job's container can reach it
+// by that hostname.
+func (d *Docker) createServiceContainer(ctx context.Context, img string, env []string, networkName, alias string) (string, error) {
+	resp, err := d.cli.ContainerCreate(ctx, &container.Config{
+		Image: img,
+		Env:   env,
+	}, nil, serviceNetworkConfig(networkName, alias), nil, "")
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+// serviceNetworkConfig builds the NetworkingConfig to attach a container
+// to networkName (under alias, if given) at creation time. Returns nil
+// when networkName is empty, so jobs without services are created exactly
+// as before — no custom network involved at all.
+func serviceNetworkConfig(networkName, alias string) *network.NetworkingConfig {
+	if networkName == "" {
+		return nil
+	}
+	endpoint := &network.EndpointSettings{}
+	if alias != "" {
+		endpoint.Aliases = []string{alias}
+	}
+	return &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			networkName: endpoint,
+		},
+	}
+}
+
 func (d *Docker) removeContainer(ctx context.Context, id string) {
 	_ = d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
+}
+
+// createNetwork creates a bridge network under a random, job-run-unique
+// name for a job's services (and the job's own container) to share, and
+// returns that name.
+func (d *Docker) createNetwork(ctx context.Context) (string, error) {
+	suffix := make([]byte, 6)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", err
+	}
+	name := "polyci-" + hex.EncodeToString(suffix)
+	if _, err := d.cli.NetworkCreate(ctx, name, network.CreateOptions{Driver: "bridge"}); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func (d *Docker) removeNetwork(ctx context.Context, name string) {
+	_ = d.cli.NetworkRemove(ctx, name)
 }
 
 // execStep runs a single step's command inside the job's already-running

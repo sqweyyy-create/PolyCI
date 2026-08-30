@@ -145,9 +145,17 @@ later — a new parser plugs into the same executor and debugger.
   user — a known annoyance shared with other local-CI-runner tools,
   not yet addressed here (e.g. by matching the container's user to
   the host UID).
-- Secondary/service containers alongside a job (GitLab's `services:`,
-  CircleCI's additional `docker:` entries beyond the first) are not
-  started — only the job's primary image runs.
+- Service containers (GitLab's `services:`, CircleCI's additional
+  `docker:` entries beyond the first) are started alongside the job's
+  own container, each on a per-job Docker bridge network, reachable
+  from the job by their alias (defaulting to the image name without
+  its registry path or tag — `pipeline.DefaultServiceAlias`) via
+  Docker's embedded per-network DNS. Both the network and every
+  service container are torn down when the job finishes, success or
+  failure — see `internal/executor/docker.go`'s `runJob` cleanup
+  stack. GitHub Actions' equivalent (`services:` on a job) isn't
+  supported yet, since that parser doesn't have a services concept at
+  all currently.
 - The CircleCI parser only supports the `docker` executor (not
   `machine`, `macos`, or `windows`), doesn't expand `orbs:` or
   top-level `commands:`, and doesn't support aliasing a job to a

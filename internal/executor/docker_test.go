@@ -528,3 +528,61 @@ func TestDiamondDependencyFailurePropagation(t *testing.T) {
 		t.Errorf("D's step ran despite being skipped: %q", log.output.String())
 	}
 }
+
+// TestServiceContainerReachableByAlias proves service containers are
+// genuinely reachable from the job's container by their configured
+// alias — not just that a container gets created. It uses a real
+// postgres server as the service and has the job connect to it over a
+// real TCP connection via psql, addressing it purely by the hostname
+// "postgres" (the alias), which only resolves if the job's container was
+// actually attached to a network shared with the service and Docker's
+// embedded DNS is doing real alias resolution. The job's own image is
+// also postgres, since that image conveniently bundles the psql client.
+func TestServiceContainerReachableByAlias(t *testing.T) {
+	log := &recordingLogger{}
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	const pgImage = "postgres:16-alpine"
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Image: pgImage,
+				Services: []pipeline.Service{
+					{
+						Image: pgImage,
+						Alias: "postgres",
+						Variables: map[string]string{
+							"POSTGRES_USER":     "testuser",
+							"POSTGRES_PASSWORD": "testpass",
+							"POSTGRES_DB":       "testdb",
+						},
+					},
+				},
+				Variables: map[string]string{"PGPASSWORD": "testpass"},
+				Steps: []pipeline.Step{
+					{Name: "connect", Command: `
+for i in $(seq 1 30); do
+  if psql -h postgres -U testuser -d testdb -c "SELECT 1" >/dev/null 2>&1; then
+    echo CONNECTED_TO_POSTGRES_VIA_ALIAS
+    exit 0
+  fi
+  sleep 1
+done
+echo TIMED_OUT_WAITING_FOR_POSTGRES
+exit 1
+`},
+				},
+			},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, log.output.String())
+	}
+	if !strings.Contains(log.output.String(), "CONNECTED_TO_POSTGRES_VIA_ALIAS") {
+		t.Errorf("job did not connect to the postgres service via its alias: %q", log.output.String())
+	}
+}

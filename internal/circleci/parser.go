@@ -32,9 +32,10 @@ var noOpStepTypes = map[string]bool{
 // jobDef is a job as declared under the top-level `jobs:` key, before it's
 // been placed into a workflow (which is what decides its stage).
 type jobDef struct {
-	image string
-	env   map[string]string
-	steps []pipeline.Step
+	image    string
+	env      map[string]string
+	steps    []pipeline.Step
+	services []pipeline.Service
 }
 
 // workflowJobRef is one entry in a workflow's `jobs:` list: which job
@@ -120,6 +121,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 				Variables: def.env,
 				Steps:     def.steps,
 				DependsOn: requiresByName[jobName],
+				Services:  def.services,
 			})
 		}
 	}
@@ -257,7 +259,7 @@ func parseJob(node *yaml.Node) (jobDef, error) {
 		return jobDef{}, err
 	}
 
-	image, err := jobImage(raw)
+	image, services, err := jobImageAndServices(raw)
 	if err != nil {
 		return jobDef{}, err
 	}
@@ -283,27 +285,53 @@ func parseJob(node *yaml.Node) (jobDef, error) {
 		return jobDef{}, fmt.Errorf("steps must not be empty")
 	}
 
-	return jobDef{image: image, env: toStringMap(raw["environment"]), steps: steps}, nil
+	return jobDef{image: image, env: toStringMap(raw["environment"]), steps: steps, services: services}, nil
 }
 
-func jobImage(raw map[string]interface{}) (string, error) {
+// jobImageAndServices reads a job's docker: list: the first entry is the
+// job's own image; any entries after it are secondary containers started
+// alongside it as services, reachable by their name: (or, if unset,
+// pipeline.DefaultServiceAlias(image)).
+func jobImageAndServices(raw map[string]interface{}) (string, []pipeline.Service, error) {
 	dockerRaw, ok := raw["docker"]
 	if !ok {
-		return "", fmt.Errorf("only the docker executor is supported (job has no docker: key)")
+		return "", nil, fmt.Errorf("only the docker executor is supported (job has no docker: key)")
 	}
 	dockerList, ok := dockerRaw.([]interface{})
 	if !ok || len(dockerList) == 0 {
-		return "", fmt.Errorf("docker: must be a non-empty list")
+		return "", nil, fmt.Errorf("docker: must be a non-empty list")
 	}
 	first, ok := dockerList[0].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("docker: first entry must be a mapping with an image: key")
+		return "", nil, fmt.Errorf("docker: first entry must be a mapping with an image: key")
 	}
 	image, ok := first["image"].(string)
 	if !ok || image == "" {
-		return "", fmt.Errorf("docker: first entry is missing image:")
+		return "", nil, fmt.Errorf("docker: first entry is missing image:")
 	}
-	return image, nil
+
+	var services []pipeline.Service
+	for i, entry := range dockerList[1:] {
+		m, ok := entry.(map[string]interface{})
+		if !ok {
+			return "", nil, fmt.Errorf("docker[%d]: must be a mapping", i+1)
+		}
+		svcImage, ok := m["image"].(string)
+		if !ok || svcImage == "" {
+			return "", nil, fmt.Errorf("docker[%d]: missing image:", i+1)
+		}
+		alias, _ := m["name"].(string)
+		if alias == "" {
+			alias = pipeline.DefaultServiceAlias(svcImage)
+		}
+		services = append(services, pipeline.Service{
+			Image:     svcImage,
+			Alias:     alias,
+			Variables: toStringMap(m["environment"]),
+		})
+	}
+
+	return image, services, nil
 }
 
 func parseStep(idx int, item interface{}) (pipeline.Step, error) {
