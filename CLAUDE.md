@@ -93,6 +93,27 @@ later — a new parser plugs into the same executor and debugger.
   plumbing in `tty_unix.go`/`tty_windows.go`) should be manually
   re-verified against a real Docker container until a reliable
   automated test exists.
+- `Shell`'s stdin-forwarding goroutine must be reliably stopped
+  *before* `Shell` returns, not just abandoned — a real terminal's
+  stdin never gives EOF on its own, so a leftover goroutine still
+  blocked in a read would race whatever the caller reads from stdin
+  next (e.g. the debugger's post-shell continue/abort/retry prompt),
+  deterministically stealing that input. The fix
+  (`waitStdinReadable` in `tty_unix.go`, backed by `poll(2)` via
+  `golang.org/x/sys/unix`) was chosen only after two other approaches
+  were tried and empirically disproven against a real pty: (1)
+  `os.File.SetReadDeadline` on a duplicated stdin fd silently never
+  fires — a dup wrapped in `os.NewFile` doesn't get properly
+  registered with the Go runtime's poller on darwin; (2)
+  `syscall.SetNonblock` on a duplicated fd looked like it worked, but
+  duplicated fds share the same underlying open file description as
+  the original in POSIX, *including status flags* — so it also made
+  the real `os.Stdin` non-blocking, silently breaking every later
+  blocking read of it (including the debugger's own prompts).
+  `poll(2)` has no such side effect: it only queries readiness, never
+  touches the fd's flags. Any future rewrite of this stdin-cancellation
+  logic should re-verify against a real pty, not just trust that an
+  approach compiles and looks right.
 - Every job's container gets the current working directory (where
   `polyci run` was invoked, overridable via `executor.WithWorkspace`
   for tests) bind-mounted read-write at /workspace, so jobs run

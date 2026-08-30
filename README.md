@@ -128,6 +128,44 @@ polyci run -shell-on-fail
 Both flags can be combined: shell on failure, then still get asked to
 continue or abort once you exit the shell.
 
+When a step failed and you enter its shell (either way), exiting the
+shell offers a third option alongside continue/abort:
+
+```
+[build] step "script[0]": [c]ontinue/[a]bort/[r]etry?
+```
+
+`r` re-runs that exact step — same container, same command — instead
+of moving on or stopping the pipeline. If it fails again, you get the
+same prompt again; if it succeeds, the pipeline continues normally
+from the next step.
+
+### Planning (dry run)
+
+`polyci plan` parses a config and prints its resolved structure —
+jobs, their dependencies, and which would run in parallel versus
+sequentially — without running anything. No Docker container is
+created and no Docker engine connection is even attempted, so it
+works even without Docker running:
+
+```sh
+polyci plan
+polyci plan -provider circleci
+polyci plan -provider github-actions -f .github/workflows/ci.yml
+```
+
+```
+Plan for .gitlab-ci.yml (3 job(s)):
+
+Level 0: build
+  - build [stage=build image=alpine:3.19] depends on: (none)
+Level 1 (parallel): test, lint
+  - test [stage=test image=alpine:3.19] depends on: build
+  - lint [stage=test image=alpine:3.19] depends on: build
+
+Levels run one after another; jobs within the same level run in parallel.
+```
+
 ### Running a pipeline
 
 The same `polyci run` works across all three providers:

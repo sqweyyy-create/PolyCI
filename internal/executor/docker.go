@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -62,6 +63,11 @@ const (
 	Continue Decision = iota
 	// Abort stops the whole pipeline immediately.
 	Abort
+	// Retry re-runs the step that just finished — same container, same
+	// command — instead of moving on or stopping. If the retry fails too,
+	// the controller is consulted again with that fresh result, so retry
+	// can be chosen repeatedly.
+	Retry
 )
 
 // ErrAborted is returned by Run/runJob when a StepController returns Abort
@@ -403,42 +409,53 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 // run" semantics.
 func (d *Docker) runSteps(ctx context.Context, containerID, jobName string, steps []pipeline.Step, stopOnFailure bool) (error, bool) {
 	var firstErr error
-	for _, step := range steps {
-		d.log.StepStart(jobName, step.Name, step.Command)
-		exitCode, stepErr := d.execStep(ctx, containerID, jobName, step)
-		d.log.StepDone(jobName, step.Name, exitCode, stepErr)
+	for i := range steps {
+		step := steps[i]
 
-		failed := stepErr != nil || exitCode != 0
-		failure := func() error {
-			if stepErr != nil {
-				return stepErr
-			}
-			return fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
-		}
+		// The inner loop re-runs this same step for as long as the
+		// controller keeps choosing Retry.
+		for {
+			d.log.StepStart(jobName, step.Name, step.Command)
+			exitCode, stepErr := d.execStep(ctx, containerID, jobName, step)
+			d.log.StepDone(jobName, step.Name, exitCode, stepErr)
 
-		if d.ctrl != nil {
-			shellFn := func(ctx context.Context) error { return d.Shell(ctx, containerID) }
-			d.ctrlMu.Lock()
-			decision := d.ctrl.AfterStep(ctx, jobName, step, exitCode, stepErr, shellFn)
-			d.ctrlMu.Unlock()
-			if decision == Abort {
-				err := ErrAborted
-				if failed {
-					err = failure()
+			failed := stepErr != nil || exitCode != 0
+			failure := func() error {
+				if stepErr != nil {
+					return stepErr
 				}
-				return err, true
+				return fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
 			}
-			// The debugger let the user override the failure; move on.
-			continue
-		}
 
-		if failed {
-			if firstErr == nil {
-				firstErr = failure()
+			if d.ctrl != nil {
+				shellFn := func(ctx context.Context) error { return d.Shell(ctx, containerID) }
+				d.ctrlMu.Lock()
+				decision := d.ctrl.AfterStep(ctx, jobName, step, exitCode, stepErr, shellFn)
+				d.ctrlMu.Unlock()
+				switch decision {
+				case Abort:
+					err := ErrAborted
+					if failed {
+						err = failure()
+					}
+					return err, true
+				case Retry:
+					continue // re-run this same step
+				default: // Continue
+					// The debugger let the user override the failure; move on.
+				}
+				break
 			}
-			if stopOnFailure {
-				return firstErr, false
+
+			if failed {
+				if firstErr == nil {
+					firstErr = failure()
+				}
+				if stopOnFailure {
+					return firstErr, false
+				}
 			}
+			break
 		}
 	}
 	return firstErr, false
@@ -547,22 +564,50 @@ func (d *Docker) Shell(ctx context.Context, containerID string) error {
 	restore := makeRawAndResize(ctx, d.cli, execResp.ID)
 	defer restore()
 
-	copyDone := make(chan struct{})
+	// A real terminal's stdin never gives EOF on its own, so the
+	// stdin-forwarding goroutine below can't just read os.Stdin directly
+	// and let io.Copy return naturally once the shell session ends — it
+	// would keep blocking in Read() forever, and whatever the user types
+	// next (e.g. answering a debugger prompt right after this call
+	// returns) would race to be consumed by that leftover goroutine
+	// instead of by the next real reader. waitStdinReadable lets us poll
+	// with a timeout instead of blocking outright, so we can reliably
+	// stop this goroutine before Shell returns rather than leaving it
+	// dangling; if polling isn't available on this platform, this just
+	// falls back to a plain blocking read (Windows today).
+	var stopForwarding atomic.Bool
+	forwardDone := make(chan struct{})
 	go func() {
-		io.Copy(attach.Conn, os.Stdin)
-		// Local stdin closed (or hit EOF): tell the container's exec so a
-		// shell reading non-interactively can exit instead of hanging.
-		attach.CloseWrite()
-		close(copyDone)
+		defer close(forwardDone)
+		buf := make([]byte, 4096)
+		for !stopForwarding.Load() {
+			ready, perr := waitStdinReadable(100 * time.Millisecond)
+			if perr == nil && !ready {
+				continue
+			}
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				if _, werr := attach.Conn.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				// Local stdin closed (or hit a real error): tell the
+				// container's exec so a shell reading non-interactively
+				// can exit instead of hanging.
+				attach.CloseWrite()
+				return
+			}
+		}
 	}()
+
 	io.Copy(os.Stdout, attach.Reader)
 
-	select {
-	case <-copyDone:
-	case <-time.After(200 * time.Millisecond):
-		// Stdin is likely still blocked on a read with no more input
-		// coming; don't hang the pipeline waiting for it.
-	}
+	// The shell session has ended (its output stream closed). Stop the
+	// forwarding goroutine and wait for it to actually exit before
+	// returning, so nothing is left racing the caller's next stdin read.
+	stopForwarding.Store(true)
+	<-forwardDone
 
 	inspect, err := d.cli.ContainerExecInspect(ctx, execResp.ID)
 	if err != nil {

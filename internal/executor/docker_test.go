@@ -253,6 +253,49 @@ func TestControllerContinuePastFailure(t *testing.T) {
 	}
 }
 
+// TestControllerRetrySucceedsOnSecondAttempt proves Retry actually re-runs
+// the same step in the same container — not just accepts a mocked result —
+// and that a retry which succeeds lets the pipeline proceed normally to
+// the next step. The step's command is stateful: it fails and leaves a
+// marker file on its first invocation, then succeeds once that marker is
+// already there, so a second real execution is required for it to pass.
+func TestControllerRetrySucceedsOnSecondAttempt(t *testing.T) {
+	hostDir := hostMountableTempDir(t)
+
+	log := &recordingLogger{}
+	ctrl := &scriptedController{decisions: []Decision{Retry, Continue, Continue}}
+	d, err := New(log, WithController(ctrl), WithWorkspace(hostDir))
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Image: "alpine:3.19",
+				Steps: []pipeline.Step{
+					{Name: "flaky", Command: "test -f retried && exit 0 || (touch retried && exit 1)"},
+					{Name: "after", Command: "echo made it to the next step"},
+				},
+			},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v, want nil (the retried step should have succeeded on its second attempt)", err)
+	}
+
+	wantCalls := []string{"job1/flaky", "job1/flaky", "job1/after"}
+	if strings.Join(ctrl.calls, ",") != strings.Join(wantCalls, ",") {
+		t.Errorf("controller calls = %v, want %v (flaky step invoked twice via retry, then the pipeline moves on)", ctrl.calls, wantCalls)
+	}
+	if !strings.Contains(log.output.String(), "made it to the next step") {
+		t.Errorf("pipeline did not proceed to the step after the retried one: %q", log.output.String())
+	}
+}
+
 // hostMountableTempDir returns a temp directory under $HOME rather than
 // t.TempDir()'s OS temp dir. Docker engines that run in a VM sharing only
 // $HOME with the host (Colima's default) can't bind-mount paths outside it

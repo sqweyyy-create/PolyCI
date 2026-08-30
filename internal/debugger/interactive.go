@@ -48,6 +48,7 @@ func (i *Interactive) AfterStep(ctx context.Context, jobName string, step pipeli
 		if err := shell(ctx); err != nil {
 			fmt.Fprintf(i.out, "[%s] shell session ended: %v\n", jobName, err)
 		}
+		return i.promptAfterShell(jobName, step)
 	}
 
 	if !i.StepByStep {
@@ -79,8 +80,35 @@ func (i *Interactive) AfterStep(ctx context.Context, jobName string, step pipeli
 			if err := shell(ctx); err != nil {
 				fmt.Fprintf(i.out, "[%s] shell session ended: %v\n", jobName, err)
 			}
+			return i.promptAfterShell(jobName, step)
 		default:
 			fmt.Fprintln(i.out, "please answer y, a, or s")
+		}
+	}
+}
+
+// promptAfterShell asks what to do once the user has exited a shell
+// dropped into for a step: continue on, abort the pipeline, or retry that
+// same step (same container, same command).
+func (i *Interactive) promptAfterShell(jobName string, step pipeline.Step) executor.Decision {
+	for {
+		fmt.Fprintf(i.out, "[%s] step %q: [c]ontinue/[a]bort/[r]etry? ", jobName, step.Name)
+
+		line, err := i.in.ReadString('\n')
+		if err != nil {
+			fmt.Fprintln(i.out, "\nno input available, aborting")
+			return executor.Abort
+		}
+
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "", "c", "continue":
+			return executor.Continue
+		case "a", "abort":
+			return executor.Abort
+		case "r", "retry":
+			return executor.Retry
+		default:
+			fmt.Fprintln(i.out, "please answer c, a, or r")
 		}
 	}
 }
