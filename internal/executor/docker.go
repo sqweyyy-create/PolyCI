@@ -282,8 +282,14 @@ func (d *Docker) removeContainer(ctx context.Context, id string) {
 // execStep runs a single step's command inside the job's already-running
 // container and streams its combined output through the Logger.
 func (d *Docker) execStep(ctx context.Context, containerID, jobName string, step pipeline.Step) (int64, error) {
+	env := make([]string, 0, len(step.Env))
+	for k, v := range step.Env {
+		env = append(env, k+"="+v)
+	}
+
 	execResp, err := d.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
 		Cmd:          []string{"sh", "-c", step.Command},
+		Env:          env,
 		WorkingDir:   workDir,
 		AttachStdout: true,
 		AttachStderr: true,

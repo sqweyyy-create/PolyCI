@@ -1,0 +1,30 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/base:2023.03
+    environment:
+      GLOBAL_VAR: hello
+    steps:
+      - checkout
+      - run: echo building
+      - run:
+          name: Run with custom env
+          command: echo "$GREETING"
+          environment:
+            GREETING: hi-from-step
+
+  test:
+    docker:
+      - image: cimg/base:2023.03
+    steps:
+      - run: echo testing
+
+workflows:
+  build-and-test:
+    jobs:
+      - build
+      - test:
+          requires:
+            - build

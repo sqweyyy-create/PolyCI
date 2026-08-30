@@ -93,3 +93,21 @@ later — a new parser plugs into the same executor and debugger.
   plumbing in `tty_unix.go`/`tty_windows.go`) should be manually
   re-verified against a real Docker container until a reliable
   automated test exists.
+- Neither the GitLab nor the CircleCI executor path checks out or
+  mounts the local repository into the job's container — jobs run
+  against whatever the image already contains, plus /workspace as an
+  empty working directory. CircleCI's `checkout` step (and any other
+  unsupported builtin step: `save_cache`, `restore_cache`,
+  `persist_to_workspace`, `attach_workspace`, `store_artifacts`,
+  `store_test_results`, `setup_remote_docker`, `add_ssh_keys`,
+  `deploy`) is turned into a visible no-op log line rather than erroring,
+  so real-world configs still parse and run, but running a job that
+  actually depends on your project's files being present will not
+  behave like real CI yet.
+- Secondary/service containers alongside a job (GitLab's `services:`,
+  CircleCI's additional `docker:` entries beyond the first) are not
+  started — only the job's primary image runs.
+- The CircleCI parser only supports the `docker` executor (not
+  `machine`, `macos`, or `windows`), doesn't expand `orbs:` or
+  top-level `commands:`, and doesn't support aliasing a job to a
+  different name via `name:` in a workflow's job list.

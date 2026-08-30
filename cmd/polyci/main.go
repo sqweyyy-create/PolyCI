@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/polyci/polyci/internal/circleci"
 	"github.com/polyci/polyci/internal/debugger"
 	"github.com/polyci/polyci/internal/executor"
 	"github.com/polyci/polyci/internal/gitlab"
+	"github.com/polyci/polyci/internal/pipeline"
 )
 
 func main() {
@@ -37,16 +39,33 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: polyci run [-f .gitlab-ci.yml] [-debug] [-shell-on-fail]")
+	fmt.Fprintln(os.Stderr, "Usage: polyci run [-provider gitlab|circleci] [-f config file] [-debug] [-shell-on-fail]")
 }
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	file := fs.String("f", ".gitlab-ci.yml", "path to the CI config file")
+	provider := fs.String("provider", "gitlab", "CI provider config format to parse: gitlab or circleci")
+	file := fs.String("f", "", "path to the CI config file (default: .gitlab-ci.yml for gitlab, .circleci/config.yml for circleci)")
 	debug := fs.Bool("debug", false, "pause after each step and ask whether to continue or abort")
 	shellOnFail := fs.Bool("shell-on-fail", false, "on a failing step, drop into an interactive shell in its container")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	var parse func([]byte) (*pipeline.Pipeline, error)
+	switch *provider {
+	case "gitlab":
+		parse = gitlab.Parse
+		if *file == "" {
+			*file = ".gitlab-ci.yml"
+		}
+	case "circleci":
+		parse = circleci.Parse
+		if *file == "" {
+			*file = ".circleci/config.yml"
+		}
+	default:
+		return fmt.Errorf("unknown provider %q (want gitlab or circleci)", *provider)
 	}
 
 	data, err := os.ReadFile(*file)
@@ -54,7 +73,7 @@ func runCmd(args []string) error {
 		return fmt.Errorf("reading %s: %w", *file, err)
 	}
 
-	p, err := gitlab.Parse(data)
+	p, err := parse(data)
 	if err != nil {
 		return fmt.Errorf("parsing %s: %w", *file, err)
 	}

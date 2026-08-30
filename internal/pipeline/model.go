@@ -31,8 +31,11 @@ type Job struct {
 	Steps     []Step
 }
 
-// Step is a single command executed inside the job's container.
+// Step is a single command executed inside the job's container. Env
+// overrides/extends the job's own Variables for this step only (used by
+// providers like CircleCI where `run` steps can set their own env).
 type Step struct {
 	Name    string
 	Command string
+	Env     map[string]string
 }
