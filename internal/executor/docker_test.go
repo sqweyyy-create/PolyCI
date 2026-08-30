@@ -274,3 +274,41 @@ func TestWorkspaceMountReadWrite(t *testing.T) {
 		t.Errorf("host-visible file content = %q, want %q", got, "hello from the container")
 	}
 }
+
+// TestAfterScriptRunsOnFailure proves the fix for after_script: it must
+// run even when a PhaseMain (script) step fails, and the job must still
+// report that failure once after_script has had its chance to run.
+func TestAfterScriptRunsOnFailure(t *testing.T) {
+	hostDir := hostMountableTempDir(t)
+
+	log := &recordingLogger{}
+	d, err := New(log, WithWorkspace(hostDir))
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Stages: []string{"build"},
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Stage: "build",
+				Image: "alpine:3.19",
+				Steps: []pipeline.Step{
+					{Name: "script[0]", Command: "false", Phase: pipeline.PhaseMain},
+					{Name: "after_script[0]", Command: "touch /workspace/after-ran", Phase: pipeline.PhaseAfter},
+				},
+			},
+		},
+	}
+
+	err = d.Run(context.Background(), p)
+	if err == nil {
+		t.Fatal("Run() = nil, want an error: the script step failed and the job should still report it")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(hostDir, "after-ran")); statErr != nil {
+		t.Fatalf("after_script did not run despite the script failure (after-ran not found on host): %v", statErr)
+	}
+}

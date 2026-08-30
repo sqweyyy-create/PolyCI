@@ -175,13 +175,13 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 
 		var steps []pipeline.Step
 		for idx, cmd := range before {
-			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("before_script[%d]", idx), Command: cmd})
+			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("before_script[%d]", idx), Command: cmd, Phase: pipeline.PhaseMain})
 		}
 		for idx, cmd := range script {
-			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("script[%d]", idx), Command: cmd})
+			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("script[%d]", idx), Command: cmd, Phase: pipeline.PhaseMain})
 		}
 		for idx, cmd := range after {
-			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("after_script[%d]", idx), Command: cmd})
+			steps = append(steps, pipeline.Step{Name: fmt.Sprintf("after_script[%d]", idx), Command: cmd, Phase: pipeline.PhaseAfter})
 		}
 
 		p.Jobs = append(p.Jobs, pipeline.Job{

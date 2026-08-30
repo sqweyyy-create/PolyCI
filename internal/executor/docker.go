@@ -226,10 +226,63 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 		return err
 	}
 
+	var mainSteps, afterSteps []pipeline.Step
 	for _, step := range job.Steps {
-		d.log.StepStart(job.Name, step.Name, step.Command)
-		exitCode, stepErr := d.execStep(ctx, containerID, job.Name, step)
-		d.log.StepDone(job.Name, step.Name, exitCode, stepErr)
+		if step.Phase == pipeline.PhaseAfter {
+			afterSteps = append(afterSteps, step)
+		} else {
+			mainSteps = append(mainSteps, step)
+		}
+	}
+
+	// PhaseMain stops at its first failure, same as before this method was
+	// split into phases. An explicit user Abort takes precedence over
+	// everything, including after_script — it means "stop right now".
+	mainErr, aborted := d.runSteps(ctx, containerID, job.Name, mainSteps, true)
+	if aborted {
+		d.log.JobDone(job.Name, mainErr)
+		return mainErr
+	}
+
+	// after_script always gets a chance to run — win, lose, or draw in
+	// PhaseMain — since it exists for cleanup/reporting regardless of
+	// outcome. It doesn't stop at its own first failure either, so every
+	// after_script step gets to run.
+	afterErr, afterAborted := d.runSteps(ctx, containerID, job.Name, afterSteps, false)
+	if afterAborted {
+		d.log.JobDone(job.Name, afterErr)
+		return afterErr
+	}
+
+	// The original PhaseMain failure (if any) is what the job is reported
+	// as failing on; after_script's own failure only surfaces if PhaseMain
+	// otherwise succeeded.
+	finalErr := mainErr
+	if finalErr == nil {
+		finalErr = afterErr
+	}
+	d.log.JobDone(job.Name, finalErr)
+	return finalErr
+}
+
+// runSteps runs steps in order, consulting the StepController (if any)
+// after each one. It returns the first failure encountered (or nil) and
+// whether a StepController explicitly aborted — an abort always stops
+// immediately and takes precedence over stopOnFailure, since it's a
+// deliberate "stop right now" decision rather than an automatic one.
+//
+// When stopOnFailure is true and there's no controller (or the controller
+// didn't override the failure), the first failing step stops the rest of
+// steps from running and its error is returned right away. When false,
+// every step still runs regardless of failures, and the first failure (if
+// any) is returned once they've all run — this is after_script's "always
+// run" semantics.
+func (d *Docker) runSteps(ctx context.Context, containerID, jobName string, steps []pipeline.Step, stopOnFailure bool) (error, bool) {
+	var firstErr error
+	for _, step := range steps {
+		d.log.StepStart(jobName, step.Name, step.Command)
+		exitCode, stepErr := d.execStep(ctx, containerID, jobName, step)
+		d.log.StepDone(jobName, step.Name, exitCode, stepErr)
 
 		failed := stepErr != nil || exitCode != 0
 		failure := func() error {
@@ -241,27 +294,27 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 
 		if d.ctrl != nil {
 			shellFn := func(ctx context.Context) error { return d.Shell(ctx, containerID) }
-			if d.ctrl.AfterStep(ctx, job.Name, step, exitCode, stepErr, shellFn) == Abort {
+			if d.ctrl.AfterStep(ctx, jobName, step, exitCode, stepErr, shellFn) == Abort {
 				err := ErrAborted
 				if failed {
 					err = failure()
 				}
-				d.log.JobDone(job.Name, err)
-				return err
+				return err, true
 			}
-			if failed {
-				// The debugger let the user override the failure; move on.
-				continue
+			// The debugger let the user override the failure; move on.
+			continue
+		}
+
+		if failed {
+			if firstErr == nil {
+				firstErr = failure()
 			}
-		} else if failed {
-			err := failure()
-			d.log.JobDone(job.Name, err)
-			return err
+			if stopOnFailure {
+				return firstErr, false
+			}
 		}
 	}
-
-	d.log.JobDone(job.Name, nil)
-	return nil
+	return firstErr, false
 }
 
 func (d *Docker) ensureImage(ctx context.Context, ref string) error {
