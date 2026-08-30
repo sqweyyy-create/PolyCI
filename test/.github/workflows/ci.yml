@@ -1,0 +1,32 @@
+name: CI
+
+on: [push]
+
+env:
+  APP_NAME: hello-world
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: alpine:3.19
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          echo "Building $APP_NAME..."
+          cat src/app.sh
+          sh src/app.sh
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    container: alpine:3.19
+    steps:
+      - run: echo "Running unit tests for $APP_NAME..."
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: build
+    container: alpine:3.19
+    steps:
+      - run: echo "Linting $APP_NAME..."

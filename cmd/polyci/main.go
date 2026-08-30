@@ -10,6 +10,7 @@ import (
 	"github.com/polyci/polyci/internal/circleci"
 	"github.com/polyci/polyci/internal/debugger"
 	"github.com/polyci/polyci/internal/executor"
+	"github.com/polyci/polyci/internal/githubactions"
 	"github.com/polyci/polyci/internal/gitlab"
 	"github.com/polyci/polyci/internal/pipeline"
 )
@@ -39,13 +40,13 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: polyci run [-provider gitlab|circleci] [-f config file] [-debug] [-shell-on-fail]")
+	fmt.Fprintln(os.Stderr, "Usage: polyci run [-provider gitlab|circleci|github-actions] [-f config file] [-debug] [-shell-on-fail]")
 }
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	provider := fs.String("provider", "gitlab", "CI provider config format to parse: gitlab or circleci")
-	file := fs.String("f", "", "path to the CI config file (default: .gitlab-ci.yml for gitlab, .circleci/config.yml for circleci)")
+	provider := fs.String("provider", "gitlab", "CI provider config format to parse: gitlab, circleci, or github-actions")
+	file := fs.String("f", "", "path to the CI config file (default: .gitlab-ci.yml for gitlab, .circleci/config.yml for circleci; required for github-actions)")
 	debug := fs.Bool("debug", false, "pause after each step and ask whether to continue or abort")
 	shellOnFail := fs.Bool("shell-on-fail", false, "on a failing step, drop into an interactive shell in its container")
 	if err := fs.Parse(args); err != nil {
@@ -64,8 +65,13 @@ func runCmd(args []string) error {
 		if *file == "" {
 			*file = ".circleci/config.yml"
 		}
+	case "github-actions":
+		parse = githubactions.Parse
+		if *file == "" {
+			return fmt.Errorf("-f is required for -provider github-actions (workflow files can be named anything under .github/workflows/)")
+		}
 	default:
-		return fmt.Errorf("unknown provider %q (want gitlab or circleci)", *provider)
+		return fmt.Errorf("unknown provider %q (want gitlab, circleci, or github-actions)", *provider)
 	}
 
 	data, err := os.ReadFile(*file)

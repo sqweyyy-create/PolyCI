@@ -131,3 +131,17 @@ later — a new parser plugs into the same executor and debugger.
   `machine`, `macos`, or `windows`), doesn't expand `orbs:` or
   top-level `commands:`, and doesn't support aliasing a job to a
   different name via `name:` in a workflow's job list.
+- The GitHub Actions parser only runs jobs that declare an explicit
+  `container:` — GitHub's default runner model executes steps
+  directly on a VM (`runs-on: ubuntu-latest`) rather than in a
+  container, and approximating that with a Docker image (as `act`
+  does, with its own curated image set) is out of scope; a job
+  without `container:` fails to parse with a clear error rather than
+  silently doing nothing. It doesn't evaluate `${{ }}` expressions
+  (github/env/matrix context, etc.) — any that appear in `run:` are
+  passed through to the shell literally, which will usually error —
+  and doesn't expand `strategy: matrix:` (each job runs once, exactly
+  as written) or `uses:` a local/composite action. Only one workflow
+  file is run per invocation (`-f` is required, since workflow files
+  can be named anything under `.github/workflows/`), not every file
+  in that directory.

@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/polyci/polyci/internal/dag"
 	"github.com/polyci/polyci/internal/pipeline"
 )
 
@@ -221,66 +222,11 @@ func parseWorkflowJobs(node *yaml.Node) ([]workflowJobRef, error) {
 // jobs grouped by ascending level, stable within a level by declaration
 // order.
 func dependencyLevels(refs []workflowJobRef) (map[string]int, []string, error) {
-	index := map[string]int{}
+	nodes := make([]dag.Node, len(refs))
 	for i, r := range refs {
-		if _, dup := index[r.name]; dup {
-			return nil, nil, fmt.Errorf("job %q listed more than once (aliasing a job with name: is not supported)", r.name)
-		}
-		index[r.name] = i
+		nodes[i] = dag.Node{Name: r.name, Depends: r.requires}
 	}
-
-	levels := map[string]int{}
-	visiting := map[string]bool{}
-
-	var resolve func(name string) (int, error)
-	resolve = func(name string) (int, error) {
-		if lvl, ok := levels[name]; ok {
-			return lvl, nil
-		}
-		i, ok := index[name]
-		if !ok {
-			return 0, fmt.Errorf("requires unknown job %q", name)
-		}
-		if visiting[name] {
-			return 0, fmt.Errorf("circular dependency involving job %q", name)
-		}
-		visiting[name] = true
-		maxDep := -1
-		for _, dep := range refs[i].requires {
-			depLvl, err := resolve(dep)
-			if err != nil {
-				return 0, err
-			}
-			if depLvl > maxDep {
-				maxDep = depLvl
-			}
-		}
-		visiting[name] = false
-		lvl := maxDep + 1
-		levels[name] = lvl
-		return lvl, nil
-	}
-
-	maxLevel := 0
-	for _, r := range refs {
-		lvl, err := resolve(r.name)
-		if err != nil {
-			return nil, nil, err
-		}
-		if lvl > maxLevel {
-			maxLevel = lvl
-		}
-	}
-
-	var order []string
-	for lvl := 0; lvl <= maxLevel; lvl++ {
-		for _, r := range refs {
-			if levels[r.name] == lvl {
-				order = append(order, r.name)
-			}
-		}
-	}
-	return levels, order, nil
+	return dag.Levels(nodes)
 }
 
 func parseJobs(node *yaml.Node) (map[string]jobDef, error) {
@@ -398,9 +344,13 @@ func noOpStep(idx int, stepType string) (pipeline.Step, error) {
 	if !noOpStepTypes[stepType] {
 		return pipeline.Step{}, fmt.Errorf("step %d: unsupported step type %q", idx, stepType)
 	}
+	reason := fmt.Sprintf("step '%s' is not supported yet, skipping", stepType)
+	if stepType == "checkout" {
+		reason = "checkout is a no-op: the repo is already mounted at /workspace"
+	}
 	return pipeline.Step{
 		Name:    fmt.Sprintf("%s[%d]", stepType, idx),
-		Command: fmt.Sprintf("echo \"polyci: step '%s' is not supported yet, skipping\"", stepType),
+		Command: fmt.Sprintf("echo \"polyci: %s\"", reason),
 	}, nil
 }
 
