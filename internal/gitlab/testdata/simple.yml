@@ -1,0 +1,28 @@
+stages:
+  - build
+  - test
+
+variables:
+  GLOBAL_VAR: "hello"
+
+build-job:
+  stage: build
+  image: alpine:3.19
+  variables:
+    JOB_VAR: "world"
+  script:
+    - echo building
+
+test-job:
+  stage: test
+  image: alpine:3.19
+  before_script:
+    - echo setup
+  script:
+    - echo testing
+  after_script:
+    - echo cleanup
+
+.hidden-template:
+  script:
+    - this should never run
