@@ -40,17 +40,21 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# `brews` (Homebrew Formula generation) is deprecated as of this goreleaser
-# version in favor of `homebrew_casks` — see https://goreleaser.com/deprecations/#brews.
-# This is goreleaser's now-preferred way to distribute precompiled binaries
-# via Homebrew, so we use it here instead of the deprecated section.
-homebrew_casks:
+# PolyCI is a plain CLI binary, not a GUI/macOS app, so a Homebrew Formula
+# (installed with a plain `brew install`, no --cask) is the right convention
+# here — even though goreleaser's own docs now steer toward homebrew_casks
+# for precompiled binaries in general, `brews` is what makes `brew install
+# polyci` work without --cask.
+brews:
   - name: polyci
-    binaries: [polyci]
     repository:
       owner: sqweyyy-create
       name: homebrew-polyci
-    directory: Casks
+    directory: Formula
     homepage: "https://github.com/sqweyyy-create/PolyCI"
     description: "Run CI/CD pipelines locally in Docker containers, with a debugger, across GitLab CI, CircleCI, and GitHub Actions"
     license: "MIT"
+    install: |
+      bin.install "polyci"
+    test: |
+      system "#{bin}/polyci", "-h"
