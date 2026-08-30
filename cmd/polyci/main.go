@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/polyci/polyci/internal/debugger"
 	"github.com/polyci/polyci/internal/executor"
 	"github.com/polyci/polyci/internal/gitlab"
 )
@@ -36,12 +37,13 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: polyci run [-f .gitlab-ci.yml]")
+	fmt.Fprintln(os.Stderr, "Usage: polyci run [-f .gitlab-ci.yml] [-debug]")
 }
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	file := fs.String("f", ".gitlab-ci.yml", "path to the CI config file")
+	debug := fs.Bool("debug", false, "pause after each step and ask whether to continue or abort")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,7 +60,12 @@ func runCmd(args []string) error {
 
 	log := newTermLogger(os.Stdout)
 
-	docker, err := executor.New(log)
+	var opts []executor.Option
+	if *debug {
+		opts = append(opts, executor.WithController(debugger.NewInteractive(os.Stdin, os.Stdout)))
+	}
+
+	docker, err := executor.New(log, opts...)
 	if err != nil {
 		return err
 	}

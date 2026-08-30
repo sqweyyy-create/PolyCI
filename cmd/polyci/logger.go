@@ -35,7 +35,9 @@ func (l *termLogger) StepDone(jobName, stepName string, exitCode int64, err erro
 	}
 	if exitCode != 0 {
 		fmt.Fprintf(l.w, "[%s] step %s exited %d\n", jobName, stepName, exitCode)
+		return
 	}
+	fmt.Fprintf(l.w, "[%s] step %s ok (exit 0)\n", jobName, stepName)
 }
 
 func (l *termLogger) JobDone(jobName string, err error) {

@@ -38,10 +38,44 @@ type Logger interface {
 	JobDone(jobName string, err error)
 }
 
+// Decision is the debugger's answer to whether the pipeline should keep
+// going after a step, returned from StepController.AfterStep.
+type Decision int
+
+const (
+	// Continue moves on to the pipeline's next step, even one that
+	// followed a failed step — a debugger may let the user override a
+	// failure and keep going to investigate further.
+	Continue Decision = iota
+	// Abort stops the whole pipeline immediately.
+	Abort
+)
+
+// ErrAborted is returned by Run/runJob when a StepController returns Abort.
+var ErrAborted = fmt.Errorf("pipeline aborted by user")
+
+// StepController is consulted after every step finishes, letting a
+// debugger layer pause the pipeline and let the user decide whether to
+// continue or abort. When nil, the executor runs straight through and
+// stops automatically at the first failing step (Phase 1 behavior).
+type StepController interface {
+	AfterStep(jobName string, step pipeline.Step, exitCode int64, stepErr error) Decision
+}
+
 // Docker executes pipelines against a Docker Engine.
 type Docker struct {
-	cli *dockerclient.Client
-	log Logger
+	cli  *dockerclient.Client
+	log  Logger
+	ctrl StepController
+}
+
+// Option configures optional behavior on a Docker executor.
+type Option func(*Docker)
+
+// WithController attaches a debugger layer that is asked, after every
+// step, whether the pipeline should continue or abort.
+func WithController(c StepController) Option {
+	return func(d *Docker) { d.ctrl = c }
 }
 
 // New connects to the local Docker Engine and returns a Docker executor. If
@@ -49,21 +83,25 @@ type Docker struct {
 // context (as `docker` itself does), so engines like Colima or Rancher
 // Desktop that aren't the "default" context are found without the caller
 // having to export DOCKER_HOST by hand.
-func New(log Logger) (*Docker, error) {
-	opts := []dockerclient.Opt{dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation()}
+func New(log Logger, opts ...Option) (*Docker, error) {
+	clientOpts := []dockerclient.Opt{dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation()}
 	if os.Getenv("DOCKER_HOST") == "" {
 		if host, err := activeContextDockerHost(); err == nil && host != "" {
-			opts = append(opts, dockerclient.WithHost(host))
+			clientOpts = append(clientOpts, dockerclient.WithHost(host))
 		}
 	}
-	cli, err := dockerclient.NewClientWithOpts(opts...)
+	cli, err := dockerclient.NewClientWithOpts(clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to Docker: %w", err)
 	}
 	if _, err := cli.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("Docker does not appear to be running: %w", err)
 	}
-	return &Docker{cli: cli, log: log}, nil
+	d := &Docker{cli: cli, log: log}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d, nil
 }
 
 // Close releases the underlying Docker client connection.
@@ -166,12 +204,23 @@ func (d *Docker) runJob(ctx context.Context, job pipeline.Job) error {
 		d.log.StepStart(job.Name, step.Name, step.Command)
 		exitCode, stepErr := d.execStep(ctx, containerID, job.Name, step)
 		d.log.StepDone(job.Name, step.Name, exitCode, stepErr)
-		if stepErr != nil {
-			d.log.JobDone(job.Name, stepErr)
-			return stepErr
-		}
-		if exitCode != 0 {
-			err := fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
+
+		failed := stepErr != nil || exitCode != 0
+
+		if d.ctrl != nil {
+			if d.ctrl.AfterStep(job.Name, step, exitCode, stepErr) == Abort {
+				d.log.JobDone(job.Name, ErrAborted)
+				return ErrAborted
+			}
+			if failed {
+				// The debugger let the user override the failure; move on.
+				continue
+			}
+		} else if failed {
+			err := stepErr
+			if err == nil {
+				err = fmt.Errorf("step %q exited with code %d", step.Name, exitCode)
+			}
 			d.log.JobDone(job.Name, err)
 			return err
 		}
