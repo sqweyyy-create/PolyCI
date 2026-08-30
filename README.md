@@ -202,6 +202,54 @@ polyci run -provider github-actions -f .github/workflows/ci.yml
 Only jobs with an explicit `container:` are runnable (see
 [Known Limitations](#known-limitations)).
 
+### Service containers
+
+Jobs that need a database or other backing service can declare one —
+GitLab's `services:` and CircleCI's additional `docker:` entries are
+both supported. Each service starts in its own container on a network
+shared with the job, so the job can reach it by hostname; both the
+service containers and the network are cleaned up when the job
+finishes, whether it succeeds or fails.
+
+**GitLab CI:**
+
+```yaml
+test:
+  image: postgres:16-alpine
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+      variables:
+        POSTGRES_PASSWORD: testpass
+  script:
+    - psql -h postgres -U postgres -c "SELECT 1"
+```
+
+A bare string (`- postgres:16-alpine`) works too — the hostname then
+defaults to the image name without its registry path or tag, so
+`postgres:16-alpine` becomes reachable as `postgres`. `services:` can
+also be set once at the top level as the default for every job; a
+job's own `services:` replaces that default rather than adding to it.
+
+**CircleCI:**
+
+```yaml
+jobs:
+  build:
+    docker:
+      - image: cimg/base:2023.03
+      - image: postgres:16-alpine
+        name: postgres
+        environment:
+          POSTGRES_PASSWORD: testpass
+    steps:
+      - run: psql -h postgres -U postgres -c "SELECT 1"
+```
+
+The first `docker:` entry is the job's own image; every entry after
+it becomes a service, reachable by its `name:` (or, if that's
+omitted, the same default-from-image-name rule as GitLab).
+
 ## Known Limitations
 
 - The workspace bind mount requires the Docker engine to be able to
@@ -217,11 +265,9 @@ Only jobs with an explicit `container:` are runnable (see
   user — a known annoyance shared with other local-CI-runner tools,
   not yet addressed here (e.g. by matching the container's user to
   the host UID).
-- Service containers (GitLab's `services:`, CircleCI's additional
-  `docker:` entries beyond the first) are started alongside the job's
-  own container on a per-job Docker network and reachable from it by
-  alias, torn down when the job finishes either way. GitHub Actions'
-  equivalent isn't supported yet.
+- GitHub Actions' equivalent of service containers (a job's
+  `services:`) isn't supported yet — only GitLab CI and CircleCI have
+  it today (see [Service containers](#service-containers) above).
 - The CircleCI parser only supports the `docker` executor (not
   `machine`, `macos`, or `windows`), doesn't expand `orbs:` or
   top-level `commands:`, and doesn't support aliasing a job to a
