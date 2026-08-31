@@ -131,9 +131,25 @@ const (
 // providers like CircleCI where `run` steps can set their own env). Phase
 // defaults to PhaseMain, which is correct for every provider except
 // GitLab's after_script.
+//
+// Shell and WorkingDirectory are both optional and left as the zero value
+// ("") by parsers that have no equivalent config keyword (or when a step
+// doesn't set one) — the executor treats an empty Shell as "sh" and an
+// empty WorkingDirectory as the job's workspace root, preserving prior
+// behavior for every config that doesn't specify either.
 type Step struct {
 	Name    string
 	Command string
 	Env     map[string]string
 	Phase   Phase
+	// Shell names the interpreter the command runs under (e.g. "sh",
+	// "bash"). Only a fixed set of shells is supported — an unrecognized
+	// value is a hard error rather than a silent fallback to sh, since
+	// silently running a step under the wrong shell can change whether it
+	// even parses, let alone what it does.
+	Shell string
+	// WorkingDirectory is the directory the command runs in, inside the
+	// container. A relative path is resolved against the workspace root;
+	// an absolute path is used as-is.
+	WorkingDirectory string
 }

@@ -586,3 +586,115 @@ exit 1
 		t.Errorf("job did not connect to the postgres service via its alias: %q", log.output.String())
 	}
 }
+
+// TestStepShellBashRunsUnderBash proves a step's Shell field actually
+// selects the interpreter it runs under, not just gets recorded and
+// ignored: bash array syntax is not valid in the "bash" image's other
+// shell (sh is a POSIX-only symlink there), so this command only succeeds
+// if it genuinely ran via bash -c rather than the previous hardcoded
+// sh -c.
+func TestStepShellBashRunsUnderBash(t *testing.T) {
+	log := &recordingLogger{}
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Image: "bash:5.2",
+				Steps: []pipeline.Step{
+					{
+						Name:    "bash-only",
+						Command: `arr=(one two three); echo "BASH_ARRAY_ELEMENT=${arr[1]}"`,
+						Shell:   "bash",
+					},
+				},
+			},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, log.output.String())
+	}
+	if !strings.Contains(log.output.String(), "BASH_ARRAY_ELEMENT=two") {
+		t.Errorf("step did not run under bash: %q", log.output.String())
+	}
+}
+
+// TestStepShellUnsupportedFailsClearly proves requesting an unsupported
+// shell (e.g. GitHub Actions' pwsh) is a clear, immediate failure rather
+// than a silent fallback to sh that would run the command under the wrong
+// interpreter without telling anyone.
+func TestStepShellUnsupportedFailsClearly(t *testing.T) {
+	log := &recordingLogger{}
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Image: "alpine:3.19",
+				Steps: []pipeline.Step{
+					{Name: "pwsh-step", Command: "Write-Host hi", Shell: "pwsh"},
+				},
+			},
+		},
+	}
+
+	err := d.Run(context.Background(), p)
+	if err == nil {
+		t.Fatal("expected an error for an unsupported shell, got nil")
+	}
+	if !strings.Contains(err.Error(), "pwsh") {
+		t.Errorf("error does not name the unsupported shell: %v", err)
+	}
+	if strings.Contains(log.output.String(), "hi") {
+		t.Errorf("step must not have actually run under any shell: %q", log.output.String())
+	}
+}
+
+// TestStepWorkingDirectoryUsedAsCwd proves a step's WorkingDirectory field
+// actually changes the container's exec working directory, not just gets
+// recorded and ignored: a relative path only resolves if the exec's cwd is
+// genuinely the subdirectory, not the workspace root the executor
+// previously always used.
+func TestStepWorkingDirectoryUsedAsCwd(t *testing.T) {
+	hostDir := hostMountableTempDir(t)
+	subDir := filepath.Join(hostDir, "subdir")
+	if err := os.Mkdir(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "marker.txt"), []byte("found in subdir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := &recordingLogger{}
+	d, err := New(log, WithWorkspace(hostDir))
+	if err != nil {
+		t.Skipf("Docker not available, skipping integration test: %v", err)
+	}
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{
+				Name:  "job1",
+				Image: "alpine:3.19",
+				Steps: []pipeline.Step{
+					// A relative path only resolves if the cwd is really
+					// subdir/, not /workspace.
+					{Name: "read-relative", Command: "cat marker.txt", WorkingDirectory: "subdir"},
+				},
+			},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, log.output.String())
+	}
+	if !strings.Contains(log.output.String(), "found in subdir") {
+		t.Errorf("step did not run with WorkingDirectory as its cwd: %q", log.output.String())
+	}
+}

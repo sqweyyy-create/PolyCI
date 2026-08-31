@@ -227,7 +227,15 @@ func parseStep(jobName string, idx int, raw map[string]interface{}) (pipeline.St
 		if name == "" {
 			name = fmt.Sprintf("run[%d]", idx)
 		}
-		step := pipeline.Step{Name: name, Command: command, Env: toStringMap(raw["env"])}
+		shell, _ := raw["shell"].(string)
+		workingDir, _ := raw["working-directory"].(string)
+		step := pipeline.Step{
+			Name:             name,
+			Command:          command,
+			Env:              toStringMap(raw["env"]),
+			Shell:            shell,
+			WorkingDirectory: workingDir,
+		}
 		var finding *pipeline.Finding
 		if expressionPattern.MatchString(command) {
 			finding = &pipeline.Finding{

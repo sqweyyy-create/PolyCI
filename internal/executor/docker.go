@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,6 +31,39 @@ import (
 )
 
 const workDir = "/workspace"
+
+// supportedShells maps a step's Shell field to the argv used to invoke it.
+// Only these shells are known to exist in the kind of minimal images CI
+// jobs typically run in; anything else (e.g. "pwsh") fails clearly in
+// shellCommand rather than silently falling back to sh, since that could
+// change whether the step's command even parses.
+var supportedShells = map[string][]string{
+	"":     {"sh", "-c"},
+	"sh":   {"sh", "-c"},
+	"bash": {"bash", "-c"},
+}
+
+// shellCommand builds the argv to exec for step, honoring its Shell field.
+func shellCommand(step pipeline.Step) ([]string, error) {
+	prefix, ok := supportedShells[step.Shell]
+	if !ok {
+		return nil, fmt.Errorf("unsupported shell %q for step %q", step.Shell, step.Name)
+	}
+	return append(append([]string{}, prefix...), step.Command), nil
+}
+
+// stepWorkingDir resolves a step's WorkingDirectory against the workspace
+// root: empty means the root itself, an absolute path is used as-is, and a
+// relative path is joined onto the root.
+func stepWorkingDir(step pipeline.Step) string {
+	if step.WorkingDirectory == "" {
+		return workDir
+	}
+	if path.IsAbs(step.WorkingDirectory) {
+		return step.WorkingDirectory
+	}
+	return path.Join(workDir, step.WorkingDirectory)
+}
 
 // Logger receives streamed pipeline output. Independent jobs run
 // concurrently, so its methods may be called from multiple goroutines at
@@ -618,15 +652,20 @@ func (d *Docker) removeNetwork(ctx context.Context, name string) {
 // execStep runs a single step's command inside the job's already-running
 // container and streams its combined output through the Logger.
 func (d *Docker) execStep(ctx context.Context, containerID, jobName string, step pipeline.Step) (int64, error) {
+	cmd, err := shellCommand(step)
+	if err != nil {
+		return -1, err
+	}
+
 	env := make([]string, 0, len(step.Env))
 	for k, v := range step.Env {
 		env = append(env, k+"="+v)
 	}
 
 	execResp, err := d.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
-		Cmd:          []string{"sh", "-c", step.Command},
+		Cmd:          cmd,
 		Env:          env,
-		WorkingDir:   workDir,
+		WorkingDir:   stepWorkingDir(step),
 		AttachStdout: true,
 		AttachStderr: true,
 	})

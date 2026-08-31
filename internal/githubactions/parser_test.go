@@ -244,3 +244,35 @@ jobs:
 		}
 	}
 }
+
+// TestParseStepShellAndWorkingDirectory proves a run: step's shell: and
+// working-directory: keys are read into pipeline.Step's Shell and
+// WorkingDirectory fields, and that a step which sets neither leaves them
+// at the zero value (the executor's cue to fall back to its defaults).
+func TestParseStepShellAndWorkingDirectory(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    steps:
+      - run: echo hi
+        shell: bash
+        working-directory: subdir
+      - run: echo plain
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	steps := p.Jobs[0].Steps
+	if len(steps) != 2 {
+		t.Fatalf("got %d steps, want 2: %+v", len(steps), steps)
+	}
+	if steps[0].Shell != "bash" || steps[0].WorkingDirectory != "subdir" {
+		t.Errorf("steps[0] = %+v, want Shell=bash WorkingDirectory=subdir", steps[0])
+	}
+	if steps[1].Shell != "" || steps[1].WorkingDirectory != "" {
+		t.Errorf("steps[1] = %+v, want Shell and WorkingDirectory left empty (no shell:/working-directory: set)", steps[1])
+	}
+}

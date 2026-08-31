@@ -236,6 +236,20 @@ polyci run -provider github-actions -f .github/workflows/ci.yml
 Only jobs with an explicit `container:` are runnable (see
 [Known Limitations](#known-limitations)).
 
+A step's `shell:` and `working-directory:` are both honored:
+
+```yaml
+steps:
+  - run: ls
+    shell: bash
+    working-directory: subdir
+```
+
+`shell:` supports `sh` (the default if unset) and `bash`; anything
+else (`pwsh`, `python`, `cmd`, a custom `command {0}` form) is a clear
+error rather than a silent fallback to `sh`. `working-directory:` may
+be relative (resolved against `/workspace`) or absolute.
+
 ### Service containers
 
 Jobs that need a database or other backing service can declare one —
@@ -329,7 +343,19 @@ omitted, the same default-from-image-name rule as GitLab).
   passed through to the shell literally, which will usually error —
   and doesn't expand `strategy: matrix:` (each job runs once, exactly
   as written) or `uses:` a local/composite action. Only one workflow
-  file is run per invocation, not every file in that directory.
+  file is run per invocation, not every file in that directory. A
+  step's `shell:` and `working-directory:` are honored (see
+  [Running a pipeline](#running-a-pipeline) above), but only `sh` and
+  `bash` are supported shells — `pwsh`, `python`, `cmd`, and the
+  custom `command {0}` form all fail clearly rather than silently
+  running under `sh`. There's no support yet for setting `shell:` or
+  `working-directory:` once for a whole job via `defaults: run:`. The
+  GitLab and CircleCI parsers don't populate either field yet either —
+  GitLab's `script:` has no equivalent keyword at all, but CircleCI's
+  `run:` step does have its own real `shell:`/`working_directory:`
+  keys that just aren't wired up yet — so every step from either of
+  those two providers still runs as `sh -c` at the workspace root
+  regardless of what the config says.
 - Phase 3's shell-on-fail feature is verified manually with a real
   TTY, not by an automated test — a `github.com/creack/pty`-based Go
   test was attempted but hung unreliably and was removed rather than
