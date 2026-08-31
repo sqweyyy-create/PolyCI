@@ -54,3 +54,57 @@ func TestLevelsDuplicateNode(t *testing.T) {
 		t.Fatal("expected error for duplicate node, got nil")
 	}
 }
+
+func TestFilterSkippedRemovesOnlySkippedNode(t *testing.T) {
+	// build -> test; lint is independent of both.
+	nodes := []Node{
+		{Name: "build"},
+		{Name: "test", Depends: []string{"build"}},
+		{Name: "lint"},
+	}
+	kept, reasons := FilterSkipped(nodes, map[string]string{"test": "no container: specified"})
+
+	if len(kept) != 2 {
+		t.Fatalf("kept = %+v, want 2 nodes (build, lint)", kept)
+	}
+	names := map[string]bool{}
+	for _, n := range kept {
+		names[n.Name] = true
+	}
+	if !names["build"] || !names["lint"] {
+		t.Errorf("kept = %+v, want build and lint present", kept)
+	}
+	if names["test"] {
+		t.Errorf("kept = %+v, want test removed (it was skipped)", kept)
+	}
+	if reasons["test"] != "no container: specified" {
+		t.Errorf(`reasons["test"] = %q, want the original reason unchanged`, reasons["test"])
+	}
+}
+
+func TestFilterSkippedCascadesThroughDependencyChain(t *testing.T) {
+	// build -> test -> deploy; deploy depends on test which depends on the
+	// skipped build, so all three of build/test/deploy should end up
+	// skipped even though only "build" was skipped directly. "lint" has no
+	// relationship to any of them and must survive untouched.
+	nodes := []Node{
+		{Name: "build"},
+		{Name: "test", Depends: []string{"build"}},
+		{Name: "deploy", Depends: []string{"test"}},
+		{Name: "lint"},
+	}
+	kept, reasons := FilterSkipped(nodes, map[string]string{"build": "no container: specified"})
+
+	if len(kept) != 1 || kept[0].Name != "lint" {
+		t.Fatalf("kept = %+v, want only lint", kept)
+	}
+	if reasons["build"] != "no container: specified" {
+		t.Errorf(`reasons["build"] = %q, want the original reason unchanged`, reasons["build"])
+	}
+	if reasons["test"] == "" || reasons["test"] == reasons["build"] {
+		t.Errorf(`reasons["test"] = %q, want a cascade reason distinct from build's own reason`, reasons["test"])
+	}
+	if reasons["deploy"] == "" {
+		t.Errorf(`reasons["deploy"] = %q, want a cascade reason (deploy depends on test, which depends on the skipped build)`, reasons["deploy"])
+	}
+}

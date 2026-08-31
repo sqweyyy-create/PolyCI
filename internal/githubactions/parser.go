@@ -81,37 +81,80 @@ func parseInDir(data []byte, dir string) (*pipeline.Pipeline, error) {
 
 	git := loadGitInfo(dir)
 
-	// Each raw job in jobs: (a "base name") expands into one or more
-	// jobDefs (more than one only if it has a strategy.matrix). expansions
-	// records which final, unique job names a base name produced, so a
-	// needs: reference to a base name can be resolved into the full list
-	// of jobs it now actually depends on.
-	defs := map[string]jobDef{}
-	expansions := map[string][]string{}
-	baseNeeds := map[string][]string{}
-	var baseNames []string
+	// Phase 1: parse every base job independently. A job-level problem
+	// (most commonly: no container:, since that's the one every real
+	// workflow with a bare runs-on: job hits) skips just that job rather
+	// than failing the whole file — every other job still gets a chance to
+	// run. Jobs that parsed fine are kept in parsed, keyed by base name;
+	// baseOrder preserves file declaration order for everything that
+	// follows.
+	type parsedBase struct {
+		defs  []jobDef
+		needs []string
+	}
+	parsed := map[string]parsedBase{}
+	skipReasons := map[string]string{}
+	var baseOrder []string
 	for i := 0; i+1 < len(jobsNode.Content); i += 2 {
 		baseName := jobsNode.Content[i].Value
+		baseOrder = append(baseOrder, baseName)
 		jobDefs, needs, err := parseJob(baseName, jobsNode.Content[i+1], globalEnv, git)
 		if err != nil {
-			return nil, fmt.Errorf("job %q: %w", baseName, err)
+			skipReasons[baseName] = err.Error()
+			continue
 		}
-		names := make([]string, len(jobDefs))
-		for j, d := range jobDefs {
+		parsed[baseName] = parsedBase{defs: jobDefs, needs: needs}
+	}
+
+	// Phase 2: a job that needs: (directly or transitively) a skipped job
+	// can't run either — dag.FilterSkipped cascades skipReasons across
+	// that dependency graph (built at the base-job level, before matrix
+	// expansion, since needs: only ever names base jobs) and hands back
+	// which base jobs are actually still runnable.
+	baseNodes := make([]dag.Node, 0, len(parsed))
+	for _, baseName := range baseOrder {
+		if pb, ok := parsed[baseName]; ok {
+			baseNodes = append(baseNodes, dag.Node{Name: baseName, Depends: pb.needs})
+		}
+	}
+	keptNodes, skipReasonsByBase := dag.FilterSkipped(baseNodes, skipReasons)
+	kept := make(map[string]bool, len(keptNodes))
+	for _, n := range keptNodes {
+		kept[n.Name] = true
+	}
+
+	// Phase 3: expand every still-runnable base job into its matrix
+	// combinations (parseJob already did the actual expansion in phase 1;
+	// this just collects it), then resolve needs: (still base names) into
+	// the full list of expanded job names each depends on. A needs:
+	// reference to a name that was never declared under jobs: at all
+	// (never in expansions, and not a skip either — those cascaded above)
+	// is still a hard parse error, same as before this change.
+	defs := map[string]jobDef{}
+	expansions := map[string][]string{}
+	for _, baseName := range baseOrder {
+		if !kept[baseName] {
+			continue
+		}
+		pb := parsed[baseName]
+		names := make([]string, len(pb.defs))
+		for j, d := range pb.defs {
 			defs[d.name] = d
 			names[j] = d.name
 		}
 		expansions[baseName] = names
-		baseNeeds[baseName] = needs
-		baseNames = append(baseNames, baseName)
 	}
 
 	var nodes []dag.Node
 	needsByName := map[string][]string{}
-	for _, baseName := range baseNames {
+	for _, baseName := range baseOrder {
+		if !kept[baseName] {
+			continue
+		}
+		pb := parsed[baseName]
 		for _, name := range expansions[baseName] {
 			var resolved []string
-			for _, needBase := range baseNeeds[baseName] {
+			for _, needBase := range pb.needs {
 				needNames, ok := expansions[needBase]
 				if !ok {
 					return nil, fmt.Errorf("job %q: needs: references unknown job %q", baseName, needBase)
@@ -152,7 +195,13 @@ func parseInDir(data []byte, dir string) (*pipeline.Pipeline, error) {
 		p.Findings = append(p.Findings, def.findings...)
 	}
 
-	if len(p.Jobs) == 0 {
+	for _, baseName := range baseOrder {
+		if reason, skipped := skipReasonsByBase[baseName]; skipped {
+			p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{Name: baseName, Reason: reason})
+		}
+	}
+
+	if len(p.Jobs) == 0 && len(p.SkippedJobs) == 0 {
 		return nil, fmt.Errorf("no runnable jobs found in config")
 	}
 	return p, nil

@@ -698,3 +698,46 @@ func TestStepWorkingDirectoryUsedAsCwd(t *testing.T) {
 		t.Errorf("step did not run with WorkingDirectory as its cwd: %q", log.output.String())
 	}
 }
+
+// TestRunSkipsUnsupportedJobButRunsTheRest proves partial job execution
+// against real Docker: a pipeline with three runnable jobs and one job the
+// parser already determined it can't run at all (recorded in
+// p.SkippedJobs, exactly as the GitLab/CircleCI/GitHub Actions parsers now
+// do for a job-level reason like "no container: specified") still runs
+// all three runnable jobs to completion and reports the fourth as skipped
+// via Logger.JobSkipped — rather than the whole Run failing because one
+// job in the file couldn't run.
+func TestRunSkipsUnsupportedJobButRunsTheRest(t *testing.T) {
+	log := &recordingLogger{}
+	d := newExecutorOrSkip(t, log)
+	defer d.Close()
+
+	p := &pipeline.Pipeline{
+		Jobs: []pipeline.Job{
+			{Name: "build", Image: "alpine:3.19", Steps: []pipeline.Step{{Name: "s", Command: "echo RAN_BUILD"}}},
+			{Name: "test", Image: "alpine:3.19", Steps: []pipeline.Step{{Name: "s", Command: "echo RAN_TEST"}}},
+			{Name: "lint", Image: "alpine:3.19", Steps: []pipeline.Step{{Name: "s", Command: "echo RAN_LINT"}}},
+		},
+		SkippedJobs: []pipeline.SkippedJob{
+			{Name: "legacy-deploy", Reason: "no container: specified"},
+		},
+	}
+
+	if err := d.Run(context.Background(), p); err != nil {
+		t.Fatalf("Run: %v, want success — the skipped job must not fail the whole run\noutput: %s", err, log.output.String())
+	}
+
+	out := log.output.String()
+	for _, want := range []string{"RAN_BUILD", "RAN_TEST", "RAN_LINT"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q — a runnable job alongside the skipped one didn't run: %q", want, out)
+		}
+	}
+
+	if !log.wasSkipped("legacy-deploy") {
+		t.Error("legacy-deploy should have been reported via JobSkipped")
+	}
+	if log.wasStarted("legacy-deploy") {
+		t.Error("legacy-deploy was never a runnable job and should never have been started")
+	}
+}

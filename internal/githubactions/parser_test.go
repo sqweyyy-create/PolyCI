@@ -63,7 +63,13 @@ func TestParseSimple(t *testing.T) {
 	}
 }
 
-func TestParseNoContainerErrors(t *testing.T) {
+// TestParseNoContainerIsSkippedNotFatal proves a job with no container: is
+// individually skipped — recorded in SkippedJobs with a clear reason —
+// rather than failing the whole file to parse. It's the only job here, so
+// Parse still succeeds with zero runnable jobs (nothing else to run) — see
+// TestParsePartialExecutionSkipsOnlyUnsupportedJob for the case where
+// other jobs in the same file are unaffected.
+func TestParseNoContainerIsSkippedNotFatal(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -71,8 +77,73 @@ jobs:
     steps:
       - run: echo hi
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for job without container:, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with build recorded as skipped", err)
+	}
+	if len(p.Jobs) != 0 {
+		t.Errorf("Jobs = %+v, want none (the only job in the file is unsupported)", p.Jobs)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "build" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for build", p.SkippedJobs)
+	}
+	if p.SkippedJobs[0].Reason == "" {
+		t.Error("SkippedJobs[0].Reason is empty, want an explanation")
+	}
+}
+
+// TestParsePartialExecutionSkipsOnlyUnsupportedJob proves the core partial-
+// execution behavior: a file with three runnable jobs and one job that
+// can't run at all (no container:) parses successfully with the three
+// runnable jobs intact and the fourth clearly recorded as skipped — not the
+// whole file failing to parse over one bad job. A fifth job that needs: the
+// unsupported one is also skipped (cascade), since it can't run without it,
+// while the three fully-independent jobs are untouched.
+func TestParsePartialExecutionSkipsOnlyUnsupportedJob(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    steps: [{run: echo build}]
+  test:
+    container: alpine:3.19
+    steps: [{run: echo test}]
+  lint:
+    container: alpine:3.19
+    steps: [{run: echo lint}]
+  legacy-deploy:
+    runs-on: ubuntu-latest
+    steps: [{run: echo deploy}]
+  publish:
+    container: alpine:3.19
+    needs: legacy-deploy
+    steps: [{run: echo publish}]
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with legacy-deploy/publish recorded as skipped", err)
+	}
+
+	gotJobs := map[string]bool{}
+	for _, j := range p.Jobs {
+		gotJobs[j.Name] = true
+	}
+	if len(p.Jobs) != 3 || !gotJobs["build"] || !gotJobs["test"] || !gotJobs["lint"] {
+		t.Fatalf("Jobs = %+v, want exactly build, test, lint", p.Jobs)
+	}
+
+	gotSkipped := map[string]string{}
+	for _, sj := range p.SkippedJobs {
+		gotSkipped[sj.Name] = sj.Reason
+	}
+	if len(p.SkippedJobs) != 2 {
+		t.Fatalf("SkippedJobs = %+v, want exactly 2 (legacy-deploy, publish)", p.SkippedJobs)
+	}
+	if gotSkipped["legacy-deploy"] == "" {
+		t.Errorf("legacy-deploy should be skipped with a reason, got %+v", p.SkippedJobs)
+	}
+	if gotSkipped["publish"] == "" {
+		t.Errorf("publish should be skipped (it needs: the unsupported legacy-deploy), got %+v", p.SkippedJobs)
 	}
 }
 
@@ -107,7 +178,10 @@ jobs:
 	}
 }
 
-func TestParseMissingRunOrUsesErrors(t *testing.T) {
+// TestParseMissingRunOrUsesIsSkipped proves a job with a malformed step
+// (neither run: nor uses:) is skipped like any other job-level problem,
+// rather than failing the whole file.
+func TestParseMissingRunOrUsesIsSkipped(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -115,8 +189,12 @@ jobs:
     steps:
       - name: oops
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for step missing run: or uses:, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with build recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "build" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for build", p.SkippedJobs)
 	}
 }
 
@@ -394,10 +472,26 @@ jobs:
 	if got := p.Jobs[0].Steps[0].Command; got != want {
 		t.Errorf("Command = %q, want %q", got, want)
 	}
-	for _, f := range p.Findings {
-		if strings.Contains(f.Feature, "github.sha") || strings.Contains(f.Feature, "github.ref") {
-			t.Errorf("unexpected finding for a successfully-substituted expression: %+v", f)
+	// A successful substitution still records a Supported-level Finding
+	// (so `polyci check`'s category breakdown has positive evidence
+	// expressions were used and resolved cleanly), but never an
+	// Emulated/Unsupported one — that would misreport a working expression
+	// as a problem.
+	var shaFinding, refFinding *pipeline.Finding
+	for i := range p.Findings {
+		f := &p.Findings[i]
+		if strings.Contains(f.Feature, "github.sha") {
+			shaFinding = f
 		}
+		if strings.Contains(f.Feature, "github.ref") {
+			refFinding = f
+		}
+	}
+	if shaFinding == nil || shaFinding.Level != pipeline.Supported {
+		t.Errorf("github.sha finding = %+v, want a Supported-level finding", shaFinding)
+	}
+	if refFinding == nil || refFinding.Level != pipeline.Supported {
+		t.Errorf("github.ref finding = %+v, want a Supported-level finding", refFinding)
 	}
 }
 

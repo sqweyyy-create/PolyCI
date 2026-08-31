@@ -52,6 +52,15 @@ func shellCommand(step pipeline.Step) ([]string, error) {
 	return append(append([]string{}, prefix...), step.Command), nil
 }
 
+// IsShellSupported reports whether shell is one execStep can actually run a
+// step's command under — the same check shellCommand makes, exposed so
+// `polyci check` can classify a step's shell: without needing Docker or
+// duplicating this package's list of supported shells.
+func IsShellSupported(shell string) bool {
+	_, ok := supportedShells[shell]
+	return ok
+}
+
 // stepWorkingDir resolves a step's WorkingDirectory against the workspace
 // root: empty means the root itself, an absolute path is used as-is, and a
 // relative path is joined onto the root.
@@ -264,7 +273,16 @@ const (
 // unaffected and still run to completion. Run itself always waits for
 // every job to reach a terminal state before returning, so one branch
 // failing early never cuts a sibling branch short.
+//
+// p.SkippedJobs — jobs the parser already determined can't run at all
+// (e.g. a GitHub Actions job with no container:) — are reported via
+// JobSkipped up front, before any job starts; they were never part of
+// p.Jobs to begin with, so nothing else in Run needs to know about them.
 func (d *Docker) Run(ctx context.Context, p *pipeline.Pipeline) error {
+	for _, sj := range p.SkippedJobs {
+		d.log.JobSkipped(sj.Name, fmt.Errorf("%s", sj.Reason))
+	}
+
 	if len(p.Jobs) == 0 {
 		return nil
 	}

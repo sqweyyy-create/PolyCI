@@ -99,7 +99,14 @@ jobs:
 	}
 }
 
-func TestParseUnknownWorkflowJobErrors(t *testing.T) {
+// TestParseUnknownWorkflowJobIsSkipped proves a workflow job reference with
+// no matching top-level jobs: definition (most commonly an orb-provided
+// job, which this parser doesn't expand) is individually skipped — build
+// still runs normally — rather than failing the whole file to parse. See
+// COMPATIBILITY.md's circleci-demo-python-flask finding, which is exactly
+// this shape (one orb-executor job blocking an otherwise-plain-docker:
+// file).
+func TestParseUnknownWorkflowJobIsSkipped(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -113,8 +120,15 @@ workflows:
       - build
       - deploy
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for job not defined under jobs:, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with deploy recorded as skipped", err)
+	}
+	if len(p.Jobs) != 1 || p.Jobs[0].Name != "build" {
+		t.Fatalf("Jobs = %+v, want only build", p.Jobs)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "deploy" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for deploy", p.SkippedJobs)
 	}
 }
 
@@ -140,7 +154,10 @@ workflows:
 	}
 }
 
-func TestParseNonDockerExecutorErrors(t *testing.T) {
+// TestParseNonDockerExecutorIsSkipped proves a job requesting a
+// non-docker executor is skipped, not a fatal parse error — it's the only
+// job here, so Parse still succeeds with zero runnable jobs.
+func TestParseNonDockerExecutorIsSkipped(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -148,12 +165,16 @@ jobs:
     steps:
       - run: echo hi
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for non-docker executor, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with build recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "build" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for build", p.SkippedJobs)
 	}
 }
 
-func TestParseMissingRunCommandErrors(t *testing.T) {
+func TestParseMissingRunCommandIsSkipped(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -162,12 +183,16 @@ jobs:
       - run:
           name: oops
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for run step missing command, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with build recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "build" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for build", p.SkippedJobs)
 	}
 }
 
-func TestParseUnsupportedStepTypeErrors(t *testing.T) {
+func TestParseUnsupportedStepTypeIsSkipped(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
@@ -175,8 +200,74 @@ jobs:
     steps:
       - some_orb/some_command
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for unsupported step type, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with build recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "build" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for build", p.SkippedJobs)
+	}
+}
+
+// TestParsePartialExecutionSkipsOnlyUnsupportedJob proves the core
+// partial-execution behavior for CircleCI: a workflow with three runnable
+// jobs and one job that can't run at all (a non-docker executor) still
+// runs the three, with the fourth clearly recorded as skipped rather than
+// the whole file failing to parse. A fifth job that requires: the
+// unsupported one is also skipped (cascade).
+func TestParsePartialExecutionSkipsOnlyUnsupportedJob(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    docker: [{image: alpine:3.19}]
+    steps: [{run: echo build}]
+  test:
+    docker: [{image: alpine:3.19}]
+    steps: [{run: echo test}]
+  lint:
+    docker: [{image: alpine:3.19}]
+    steps: [{run: echo lint}]
+  legacy-deploy:
+    machine: true
+    steps: [{run: echo deploy}]
+  publish:
+    docker: [{image: alpine:3.19}]
+    steps: [{run: echo publish}]
+workflows:
+  main:
+    jobs:
+      - build
+      - test
+      - lint
+      - legacy-deploy
+      - publish:
+          requires: [legacy-deploy]
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with legacy-deploy/publish recorded as skipped", err)
+	}
+
+	gotJobs := map[string]bool{}
+	for _, j := range p.Jobs {
+		gotJobs[j.Name] = true
+	}
+	if len(p.Jobs) != 3 || !gotJobs["build"] || !gotJobs["test"] || !gotJobs["lint"] {
+		t.Fatalf("Jobs = %+v, want exactly build, test, lint", p.Jobs)
+	}
+
+	gotSkipped := map[string]string{}
+	for _, sj := range p.SkippedJobs {
+		gotSkipped[sj.Name] = sj.Reason
+	}
+	if len(p.SkippedJobs) != 2 {
+		t.Fatalf("SkippedJobs = %+v, want exactly 2 (legacy-deploy, publish)", p.SkippedJobs)
+	}
+	if gotSkipped["legacy-deploy"] == "" {
+		t.Errorf("legacy-deploy should be skipped with a reason, got %+v", p.SkippedJobs)
+	}
+	if gotSkipped["publish"] == "" {
+		t.Errorf("publish should be skipped (it requires: the unsupported legacy-deploy), got %+v", p.SkippedJobs)
 	}
 }
 

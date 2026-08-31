@@ -72,12 +72,12 @@ func substituteExpressions(s, jobName, stepName string, ctx exprContext) (string
 	out := expressionPattern.ReplaceAllStringFunc(s, func(match string) string {
 		inner := strings.TrimSpace(expressionPattern.FindStringSubmatch(match)[1])
 
-		record := func(detail string) {
+		record := func(level pipeline.FindingLevel, detail string) {
 			findings = append(findings, pipeline.Finding{
 				Job:     jobName,
 				Step:    stepName,
 				Feature: "${{ " + inner + " }}",
-				Level:   pipeline.Unsupported,
+				Level:   level,
 				Detail:  detail,
 			})
 		}
@@ -87,7 +87,7 @@ func substituteExpressions(s, jobName, stepName string, ctx exprContext) (string
 		// substituting something plausible-looking would be worse than an
 		// obviously-unexpanded ${{ }} in the command.
 		unsupported := func(detail string) string {
-			record(detail)
+			record(pipeline.Unsupported, detail)
 			return match
 		}
 		// degraded is for a context we do support in principle, but whose
@@ -96,29 +96,43 @@ func substituteExpressions(s, jobName, stepName string, ctx exprContext) (string
 		// fallback a real shell gives an unset variable, rather than
 		// leaving the raw ${{ }} syntax for the shell to choke on.
 		degraded := func(detail string) string {
-			record(detail)
+			record(pipeline.Unsupported, detail)
 			return ""
+		}
+		// supported records a successful substitution. Most fully-working
+		// features never need a Finding at all, but `polyci check`'s
+		// category breakdown needs positive evidence that an expression
+		// was both present and resolved cleanly — the substituted text
+		// left behind in the final command looks identical to text that
+		// never had an expression in it at all, so without this the
+		// Expressions category could never tell "used, fully supported"
+		// apart from "never used".
+		supported := func(detail, value string) string {
+			record(pipeline.Supported, detail)
+			return value
 		}
 
 		switch {
 		case matrixExprPattern.MatchString(inner):
 			key := matrixExprPattern.FindStringSubmatch(inner)[1]
 			if v, ok := ctx.matrix[key]; ok {
-				return v
+				return supported("substituted from this job's strategy.matrix", v)
 			}
 			return unsupported(fmt.Sprintf("matrix.%s is not defined by this job's strategy.matrix", key))
 
 		case envExprPattern.MatchString(inner):
 			key := envExprPattern.FindStringSubmatch(inner)[1]
 			// An env var that isn't set evaluates to empty, the same way
-			// an unset shell variable would — no Finding needed for that.
-			return ctx.env[key]
+			// an unset shell variable would — still a fully-supported
+			// resolution of the env. context, not a problem worth flagging
+			// on its own.
+			return supported("substituted from env: (empty if unset, same as an unset shell variable)", ctx.env[key])
 
 		case inner == "github.sha":
 			if !ctx.git.available {
 				return degraded("not running inside a git repository; substituted with an empty string")
 			}
-			return ctx.git.sha
+			return supported("substituted from the local git repository's HEAD commit", ctx.git.sha)
 
 		case inner == "github.ref":
 			if !ctx.git.available {
@@ -127,7 +141,7 @@ func substituteExpressions(s, jobName, stepName string, ctx exprContext) (string
 			if ctx.git.ref == "" {
 				return degraded("HEAD is detached (no symbolic ref); substituted with an empty string")
 			}
-			return ctx.git.ref
+			return supported("substituted from the local git repository's current ref", ctx.git.ref)
 
 		default:
 			return unsupported("expression syntax is not evaluated; the literal, unexpanded text is used")

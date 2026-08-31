@@ -79,20 +79,46 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		return nil, fmt.Errorf("no top-level 'jobs' section found")
 	}
 
-	jobDefs, err := parseJobs(jobsNode)
+	jobDefs, jobSkipReasons, err := parseJobs(jobsNode)
 	if err != nil {
 		return nil, err
 	}
 
-	workflowOrder, workflowJobs, err := parseWorkflows(workflowsNode, jobDefs)
+	workflowOrder, workflowJobs, err := parseWorkflows(workflowsNode, jobDefs, jobSkipReasons)
 	if err != nil {
 		return nil, err
 	}
 
 	p := &pipeline.Pipeline{}
+	skippedSeen := map[string]bool{}
 	for _, wfName := range workflowOrder {
 		refs := workflowJobs[wfName]
-		levels, order, err := dependencyLevels(refs)
+
+		// A workflow job reference with no matching top-level jobs:
+		// definition — either because that job failed to parse (a
+		// job-level problem, e.g. a non-docker executor) or because it's
+		// not defined under jobs: at all (most commonly: an orb-provided
+		// job, which this parser doesn't expand) — is skipped rather than
+		// failing the whole file. dag.FilterSkipped then cascades that
+		// skip to any other job in the same workflow that requires: it,
+		// since a job that depends on a job PolyCI can't run can't run
+		// either; every job unrelated to it still runs normally.
+		nodes := make([]dag.Node, len(refs))
+		initialSkips := map[string]string{}
+		for i, r := range refs {
+			nodes[i] = dag.Node{Name: r.name, Depends: r.requires}
+			if _, ok := jobDefs[r.name]; ok {
+				continue
+			}
+			if reason, known := jobSkipReasons[r.name]; known {
+				initialSkips[r.name] = reason
+			} else {
+				initialSkips[r.name] = "not defined under jobs: (orb-provided jobs and top-level commands: aren't supported)"
+			}
+		}
+		keptNodes, allSkipReasons := dag.FilterSkipped(nodes, initialSkips)
+
+		levels, order, err := dag.Levels(keptNodes)
 		if err != nil {
 			return nil, fmt.Errorf("workflow %q: %w", wfName, err)
 		}
@@ -115,7 +141,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		for _, jobName := range order {
 			def, ok := jobDefs[jobName]
 			if !ok {
-				return nil, fmt.Errorf("workflow %q: job %q not found under jobs: (orb jobs are not supported)", wfName, jobName)
+				return nil, fmt.Errorf("internal error: workflow %q's kept job %q has no definition", wfName, jobName)
 			}
 			p.Jobs = append(p.Jobs, pipeline.Job{
 				Name:      jobName,
@@ -128,9 +154,16 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			})
 			p.Findings = append(p.Findings, def.findings...)
 		}
+
+		for _, r := range refs {
+			if reason, skipped := allSkipReasons[r.name]; skipped && !skippedSeen[r.name] {
+				skippedSeen[r.name] = true
+				p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{Name: r.name, Reason: reason})
+			}
+		}
 	}
 
-	if len(p.Jobs) == 0 {
+	if len(p.Jobs) == 0 && len(p.SkippedJobs) == 0 {
 		return nil, fmt.Errorf("no runnable jobs found in config")
 	}
 	return p, nil
@@ -139,10 +172,14 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 // parseWorkflows returns workflow names in declaration order and each
 // one's job references. When there's no `workflows:` section at all, it
 // falls back to CircleCI's legacy default: run the single job named
-// "build" if one exists.
-func parseWorkflows(workflowsNode *yaml.Node, jobDefs map[string]jobDef) ([]string, map[string][]workflowJobRef, error) {
+// "build" if one exists — including if "build" exists under jobs: but
+// failed to parse, in which case the caller's usual per-workflow skip
+// handling reports it rather than this function failing outright.
+func parseWorkflows(workflowsNode *yaml.Node, jobDefs map[string]jobDef, jobSkipReasons map[string]string) ([]string, map[string][]workflowJobRef, error) {
 	if workflowsNode == nil {
-		if _, ok := jobDefs["build"]; !ok {
+		_, defined := jobDefs["build"]
+		_, skipped := jobSkipReasons["build"]
+		if !defined && !skipped {
 			return nil, nil, fmt.Errorf("no workflows section and no 'build' job found")
 		}
 		return []string{"default"}, map[string][]workflowJobRef{
@@ -241,20 +278,27 @@ func dependencyLevels(refs []workflowJobRef) (map[string]int, []string, error) {
 	return dag.Levels(nodes)
 }
 
-func parseJobs(node *yaml.Node) (map[string]jobDef, error) {
+// parseJobs parses every entry under the top-level jobs: mapping. A job
+// that fails to parse (e.g. a non-docker executor) doesn't fail the whole
+// config — its reason is recorded in the returned skip map instead, and
+// the caller (Parse, via each workflow that references it) turns that into
+// a SkippedJob rather than an error, so every other job still runs.
+func parseJobs(node *yaml.Node) (defs map[string]jobDef, skipReasons map[string]string, err error) {
 	if node.Kind != yaml.MappingNode {
-		return nil, fmt.Errorf("jobs: must be a mapping")
+		return nil, nil, fmt.Errorf("jobs: must be a mapping")
 	}
-	defs := map[string]jobDef{}
+	defs = map[string]jobDef{}
+	skipReasons = map[string]string{}
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		name := node.Content[i].Value
 		def, err := parseJob(name, node.Content[i+1])
 		if err != nil {
-			return nil, fmt.Errorf("job %q: %w", name, err)
+			skipReasons[name] = err.Error()
+			continue
 		}
 		defs[name] = def
 	}
-	return defs, nil
+	return defs, skipReasons, nil
 }
 
 func parseJob(jobName string, node *yaml.Node) (jobDef, error) {

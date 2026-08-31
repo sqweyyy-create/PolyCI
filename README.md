@@ -172,9 +172,8 @@ Levels run one after another; jobs within the same level run in parallel.
 run it — every job/step is classified as Supported, Emulated (handled,
 but not identically to the real provider — e.g. `checkout` is a no-op
 because the workspace is already mounted), or Unsupported (recognized
-but not implemented, which may change job behavior), followed by an
-estimated fidelity percentage. Like `plan`, it never touches Docker
-and never runs anything:
+but not implemented, which may change job behavior). Like `plan`, it
+never touches Docker and never runs anything:
 
 ```sh
 polyci check
@@ -183,22 +182,62 @@ polyci check -provider github-actions -f .github/workflows/ci.yml
 ```
 
 ```
-Compatibility check for .circleci/config.yml (3 job(s), 6 step(s)):
-
-  Supported:   5
-  Emulated:    1
-  Unsupported: 0
+Compatibility check for .circleci/config.yml (3 job(s) runnable, 0 job(s) skipped, 6 step(s)):
 
 Emulated (approximated, not a faithful implementation):
   - [build/checkout[0]] checkout: Emulated — checkout is a no-op: the repo is already mounted at /workspace
 
-Estimated fidelity: 100% (6/6 units fully supported or emulated; 0 unsupported)
+Category breakdown:
+  Environment:              Supported
+  Shell/working-directory:  Not Present
+  Filesystem/checkout:      Emulated
+  Services:                 Not Present
+  Expressions:              Not Present
+
+Overall confidence: MEDIUM
 ```
+
+Rather than a single percentage — which would average "emulated" and
+"fully supported" into one misleadingly precise number — `check`
+breaks fidelity down by category (Environment, Shell/working-directory,
+Filesystem/checkout, Services, Expressions; "Not Present" means the
+config never exercises that category at all), then reduces that to an
+overall **HIGH/MEDIUM/LOW** confidence label: HIGH means every
+category the config actually uses is fully Supported; MEDIUM/LOW scale
+with how many categories are Emulated or Unsupported (each Unsupported
+category counts double an Emulated one).
+
+Any job PolyCI recognized but couldn't run at all (see "Partial job
+execution" below) is listed by name with its reason, separately from
+the Emulated/Unsupported feature findings.
 
 Run this before `polyci run` on an unfamiliar real-world config to see
 what won't behave identically to the real provider — see
 [`COMPATIBILITY.md`](./COMPATIBILITY.md) for a compatibility pass
 against 15 real-world configs.
+
+### Partial job execution
+
+A job PolyCI can't run at all — most commonly a GitHub Actions job
+with no `container:`, but also a CircleCI job on a non-`docker:`
+executor, or a workflow job referencing something not defined under
+`jobs:` (e.g. an orb-provided job) — no longer fails the whole file.
+It's individually skipped, with a clear reason, while every other job
+in the same file still runs normally. A job that `needs:`/`requires:`
+a skipped job is skipped too, since it can't run without it, but that
+never affects jobs unrelated to it. Both `polyci run` and `polyci
+check` (and `polyci plan`) report every skipped job by name and
+reason:
+
+```
+==> [legacy-deploy] SKIPPED: no container: specified — running jobs on a bare runs-on: runner (without an explicit container image) is not supported
+==> [publish] SKIPPED: depends on skipped job "legacy-deploy": no container: specified — running jobs on a bare runs-on: runner (without an explicit container image) is not supported
+==> [build] stage=level-0 image=alpine:3.19
+...
+```
+
+This never changes what a *runnable* job does — it only stops one
+unsupported job from silently taking three working ones down with it.
 
 ### Running a pipeline
 
@@ -383,8 +422,9 @@ omitted, the same default-from-image-name rule as GitLab).
   directly on a VM (`runs-on: ubuntu-latest`) rather than in a
   container, and approximating that with a Docker image (as `act`
   does, with its own curated image set) is out of scope; a job
-  without `container:` fails to parse with a clear error rather than
-  silently doing nothing. Only a small, deliberately minimal subset of
+  without `container:` is individually skipped with a clear reason
+  (see [Partial job execution](#partial-job-execution) above) rather
+  than silently doing nothing or failing the whole file. Only a small, deliberately minimal subset of
   `${{ }}` expression syntax is evaluated — `matrix.<key>`, `env.<KEY>`,
   `github.sha`, and `github.ref` (see
   [Running a pipeline](#running-a-pipeline) above) — everything else
@@ -409,6 +449,14 @@ omitted, the same default-from-image-name rule as GitLab).
   keys that just aren't wired up yet — so every step from either of
   those two providers still runs as `sh -c` at the workspace root
   regardless of what the config says.
+- Partial job execution (see above) only skips a job for a *job-level*
+  reason — a config-wide problem (invalid YAML, a missing top-level
+  `jobs:` section, GitLab's `include:`, multi-document YAML) still
+  fails the whole file, since there's no individual job to skip in the
+  first place. A `needs:`/`requires:` reference to a name that was
+  never declared as a job at all (a real typo, not a recognized-but-
+  unsupported job) is still a hard parse error too, to keep that
+  distinct from "PolyCI recognizes this job but can't run it."
 - Phase 3's shell-on-fail feature is verified manually with a real
   TTY, not by an automated test — a `github.com/creack/pty`-based Go
   test was attempted but hung unreliably and was removed rather than

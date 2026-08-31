@@ -28,6 +28,51 @@ document is for.
 > are left as originally written to preserve the record of what was
 > found and how; they no longer reflect current behavior where noted.
 
+> **Update (2026-08-31): partial job execution.** All 6 "Failed to
+> parse" GitHub Actions files below, plus both CircleCI orb/executor
+> ones, failed because ONE unsupported job aborted parsing of the
+> *entire* file — even though every other job in the same file was
+> perfectly runnable. That's now fixed: a job PolyCI can't run at all
+> (no `container:`, a non-`docker:` CircleCI executor, an orb-provided
+> job CircleCI-workflow references but never defines) is individually
+> skipped — recorded in `Pipeline.SkippedJobs` with a clear reason, and
+> printed by both `polyci run` and `polyci check` — while every other
+> job in the file still runs normally. A job that `needs:`/`requires:`
+> a skipped job is itself skipped too (cascading, via the new
+> `dag.FilterSkipped`), rather than crashing on an unresolvable
+> dependency. Re-running every file below through `polyci check`
+> against the *current* PolyCI (re-fetching each file fresh, so a few
+> counts differ slightly from the original pass below where the
+> project's default branch has since changed) gives:
+>
+> | File | Before | After |
+> |---|---|---|
+> | `redis/redis` | ❌ Failed to parse | ✅ 3 runnable, 5 skipped (no `container:`) |
+> | `prometheus/prometheus` | ❌ Failed to parse | ✅ 7 runnable, 15 skipped (no `container:`, some cascaded) |
+> | `CircleCI-Public/circleci-demo-python-flask` | ❌ Failed to parse | ✅ 1 runnable (`build`), 1 skipped (`deploy`'s orb executor) |
+> | `sindresorhus/execa` | ❌ Failed to parse | ⚠️ 0 runnable, 1 skipped — its only job has no `container:`, so there's nothing to partially succeed *at*, but it's now a clean report instead of a crash |
+> | `psf/requests` | ❌ Failed to parse | ⚠️ 0 runnable, 3 skipped (same shape as `execa` — no job in the file has `container:`) |
+> | `gin-gonic/gin` | ❌ Failed to parse | ⚠️ 0 runnable, 2 skipped (same shape) |
+> | `vitejs/vite` | ❌ Failed to parse | ⚠️ 0 runnable, 5 skipped (same shape) |
+> | `babel/babel` | ❌ Failed to parse | ⚠️ 0 runnable, 1 skipped — its current `.circleci/config.yml` now declares only one job (`build-standalone`), which uses a named `executors:` block instead of inline `docker:` |
+>
+> Two files stay ❌ **unaffected**, since their cause has nothing to do
+> with per-job execution: `gitlab.com/gitlab-org/gitlab-runner` (every
+> real job lives behind `include:`, so the top level has no job-shaped
+> entries at all to even attempt skipping) and
+> `gitlab.com/inkscape/inkscape` (a duplicate-YAML-key decode error,
+> before any job is ever reached). `gitlab.gnome.org/GNOME/gimp` now
+> technically returns success (0 runnable, 1 job named `spec` skipped
+> for "no image specified") instead of erroring — but this is a
+> parser-edge-case artifact, not a real fix: `gopkg.in/yaml.v3`'s
+> `Unmarshal` only ever decodes a multi-document YAML file's *first*
+> document, which for this file is just the CI/CD Components
+> `spec:`/`inputs:` block; the real jobs (in the second document) are
+> still never reached. "1 job skipped" here refers to that spurious
+> `spec:` entry being misidentified as a job, not to anything a real
+> GitLab pipeline would call a job — multi-document YAML support
+> remains a genuine gap, not something partial execution touches.
+
 **Method:** for each file, only the config file itself was downloaded (not
 the full source repository, except where noted) into an empty directory,
 then `polyci plan` was run (safe, parses only, no Docker), and `polyci
@@ -53,7 +98,7 @@ Three outcomes are possible for each file:
 | [`gitlab.com/fdroid/fdroidclient`](https://gitlab.com/fdroid/fdroidclient/-/blob/master/.gitlab-ci.yml) | ⚠️ Parsed, diverges *(both causes fixed as of 2026-08-31 — see Update note above)* | `extends:` is silently ignored; a real job named `pages` is silently dropped entirely |
 | [`gitlab.com/inkscape/inkscape`](https://gitlab.com/inkscape/inkscape/-/blob/master/.gitlab-ci.yml) | ❌ Failed to parse | Duplicate YAML mapping keys (three `if:` under one `rules:` entry) |
 | [`gitlab.com/gitlab-org/gitlab-runner`](https://gitlab.com/gitlab-org/gitlab-runner/-/blob/main/.gitlab-ci.yml) | ❌ Failed to parse | Every real job lives in `include:`d files; `include:` isn't supported |
-| [`gitlab.gnome.org/GNOME/gimp`](https://gitlab.gnome.org/GNOME/gimp/-/blob/master/.gitlab-ci.yml) | ❌ Failed to parse | Top-level `spec:`/`inputs:` (CI/CD Components) block, plus the file is multi-document YAML |
+| [`gitlab.gnome.org/GNOME/gimp`](https://gitlab.gnome.org/GNOME/gimp/-/blob/master/.gitlab-ci.yml) | ❌ Failed to parse *(now returns success but for a spurious reason — see partial-execution Update note above)* | Top-level `spec:`/`inputs:` (CI/CD Components) block, plus the file is multi-document YAML |
 
 ### Details
 
@@ -177,8 +222,8 @@ Not currently mentioned in Known Limitations.
 
 | Source | Outcome | Cause |
 |---|---|---|
-| [`CircleCI-Public/circleci-demo-python-flask`](https://github.com/CircleCI-Public/circleci-demo-python-flask/blob/master/.circleci/config.yml) | ❌ Failed to parse | `deploy` job uses an orb-provided `executor: heroku/default` |
-| [`babel/babel`](https://github.com/babel/babel/blob/main/.circleci/config.yml) | ❌ Failed to parse | Jobs reference a named, locally-defined `executors:` block instead of inline `docker:` |
+| [`CircleCI-Public/circleci-demo-python-flask`](https://github.com/CircleCI-Public/circleci-demo-python-flask/blob/master/.circleci/config.yml) | ❌ Failed to parse *(now partially succeeds — see partial-execution Update note above)* | `deploy` job uses an orb-provided `executor: heroku/default` |
+| [`babel/babel`](https://github.com/babel/babel/blob/main/.circleci/config.yml) | ❌ Failed to parse *(now reports cleanly — see partial-execution Update note above)* | Jobs reference a named, locally-defined `executors:` block instead of inline `docker:` |
 | [`scikit-learn/scikit-learn`](https://github.com/scikit-learn/scikit-learn/blob/main/.circleci/config.yml) | ✅ Parsed and ran (as far as possible) | — ran correctly up to needing real repo files |
 | [`yarnpkg/yarn`](https://github.com/yarnpkg/yarn/blob/master/.circleci/config.yml) | ❌ Failed to parse | Duplicate YAML merge keys (`<<: *a` then `<<: *b` in one mapping) |
 
@@ -271,12 +316,12 @@ keys (including duplicate merge keys) than `gopkg.in/yaml.v3`'s default
 
 | Source | Outcome | Cause |
 |---|---|---|
-| [`sindresorhus/execa`](https://github.com/sindresorhus/execa/blob/main/.github/workflows/main.yml) | ❌ Failed to parse | No `container:` (matrix over OS + Node version) |
-| [`psf/requests`](https://github.com/psf/requests/blob/main/.github/workflows/run-tests.yml) | ❌ Failed to parse | No `container:` |
-| [`gin-gonic/gin`](https://github.com/gin-gonic/gin/blob/master/.github/workflows/gin.yml) | ❌ Failed to parse | No `container:` (also uses real `needs:`, matrix) |
-| [`vitejs/vite`](https://github.com/vitejs/vite/blob/main/.github/workflows/ci.yml) | ❌ Failed to parse | No `container:` |
-| [`redis/redis`](https://github.com/redis/redis/blob/unstable/.github/workflows/ci.yml) | ❌ Failed to parse | 3 of 8 jobs use `container:`, the other 5 don't — one blocks the whole file |
-| [`prometheus/prometheus`](https://github.com/prometheus/prometheus/blob/main/.github/workflows/ci.yml) | ❌ Failed to parse | 9 of 22 jobs use `container:`, the other 13 don't |
+| [`sindresorhus/execa`](https://github.com/sindresorhus/execa/blob/main/.github/workflows/main.yml) | ❌ Failed to parse *(now reports cleanly — see partial-execution Update note above)* | No `container:` (matrix over OS + Node version) |
+| [`psf/requests`](https://github.com/psf/requests/blob/main/.github/workflows/run-tests.yml) | ❌ Failed to parse *(now reports cleanly — see partial-execution Update note above)* | No `container:` |
+| [`gin-gonic/gin`](https://github.com/gin-gonic/gin/blob/master/.github/workflows/gin.yml) | ❌ Failed to parse *(now reports cleanly — see partial-execution Update note above)* | No `container:` (also uses real `needs:`, matrix) |
+| [`vitejs/vite`](https://github.com/vitejs/vite/blob/main/.github/workflows/ci.yml) | ❌ Failed to parse *(now reports cleanly — see partial-execution Update note above)* | No `container:` |
+| [`redis/redis`](https://github.com/redis/redis/blob/unstable/.github/workflows/ci.yml) | ❌ Failed to parse *(now partially succeeds — see partial-execution Update note above)* | 3 of 8 jobs use `container:`, the other 5 don't — one blocks the whole file |
+| [`prometheus/prometheus`](https://github.com/prometheus/prometheus/blob/main/.github/workflows/ci.yml) | ❌ Failed to parse *(now partially succeeds — see partial-execution Update note above)* | 9 of 22 jobs use `container:`, the other 13 don't |
 
 ### Details
 
@@ -365,6 +410,29 @@ job name — are fixed; see the Update note under "Tested against"
 above. `include:` remains unimplemented, but is no longer silent: the
 parser now records it as an Unsupported finding, visible via the new
 `polyci check` command.)
+
+**Updated summary, after partial job execution (2026-08-31):** the
+table above is left as originally measured, since "Failed to parse"
+was a true, meaningful category at the time. It no longer is, for
+GitHub Actions specifically — "no `container:`" was always a
+per-*job* problem, never a per-*file* one, so once an unsupported job
+stopped taking the whole file down with it, every GitHub Actions
+"Failed to parse" outcome in this report changed:
+
+| Provider | Sampled | Fully/partially runnable | Diverges | Failed to parse |
+|---|---|---|---|---|
+| GitLab CI | 5 | 1 | 1 | 3 *(unchanged — none of the 3 failures here were a per-job problem)* |
+| CircleCI | 4 | 2 *(`circleci-demo-python-flask` gained a runnable `build` job)* | 0 | 2 *(`babel/babel`, `yarnpkg/yarn` — YAML-decode failures, unaffected)* |
+| GitHub Actions | 6 | 2 *(`redis/redis`, `prometheus/prometheus` now genuinely run some jobs)* | 0 | 0 — down from 6; the other 4 (`execa`, `requests`, `gin`, `vite`) now parse and report cleanly with 0 runnable jobs, since literally every job in those specific files lacks `container:` — an honest zero-job report, not a crash, but still not "runnable" |
+
+The remaining GitHub Actions "0 runnable" files aren't a partial-
+execution gap — they're files where *every* job happens to need the
+one thing (`container:`) this whole tool is built around not
+approximating (see [`README.md`](./README.md#known-limitations)).
+Partial execution can't manufacture a runnable job that isn't there;
+what it fixes is one bad job no longer being able to hide three good
+ones. See the partial-job-execution Update note near the top of this
+document for the full before/after per file.
 
 This report reflects one sampling pass on one day against whatever these
 repositories' default branches contained at the time — it's a snapshot,

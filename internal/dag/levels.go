@@ -83,3 +83,52 @@ func Levels(nodes []Node) (levels map[string]int, order []string, err error) {
 	}
 	return levels, order, nil
 }
+
+// FilterSkipped removes every node named in skipped from nodes, along with
+// any node that (transitively, through Depends) needs one of them — a job
+// that depends on a job PolyCI can't run can't run either. It's how a
+// provider parser turns a handful of individually-unsupported jobs (e.g. a
+// GitHub Actions job with no container:) into a pipeline where every other
+// job, including ones that don't depend on the unsupported one, still runs
+// normally instead of the whole file failing to parse.
+//
+// It returns the surviving nodes (in the same relative order as nodes) and
+// the full skip reason for every name that ended up skipped: unchanged for
+// names already in skipped, and a generated "depends on skipped job ..."
+// reason — composing through any chain, however long — for every node
+// skipped only because of the cascade.
+func FilterSkipped(nodes []Node, skipped map[string]string) (kept []Node, reasons map[string]string) {
+	reasons = make(map[string]string, len(skipped))
+	for name, reason := range skipped {
+		reasons[name] = reason
+	}
+
+	// Repeatedly mark any node that depends on an already-skipped node,
+	// until a full pass adds nothing new — handles a chain of any length,
+	// regardless of the order nodes happen to be declared in.
+	for {
+		changed := false
+		for _, n := range nodes {
+			if _, already := reasons[n.Name]; already {
+				continue
+			}
+			for _, dep := range n.Depends {
+				if depReason, isSkipped := reasons[dep]; isSkipped {
+					reasons[n.Name] = fmt.Sprintf("depends on skipped job %q: %s", dep, depReason)
+					changed = true
+					break
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
+	for _, n := range nodes {
+		if _, skip := reasons[n.Name]; !skip {
+			kept = append(kept, n)
+		}
+	}
+	return kept, reasons
+}

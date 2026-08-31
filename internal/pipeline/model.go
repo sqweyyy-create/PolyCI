@@ -10,11 +10,30 @@ import "strings"
 type Pipeline struct {
 	Stages []string
 	Jobs   []Job
-	// Findings records config features the parser recognized as not
-	// fully faithful to the real provider — for `polyci check` to report.
-	// Populating this never changes what Run executes; it's purely
+	// Findings records config features the parser recognized as not fully
+	// faithful to the real provider (Emulated/Unsupported), or — for a
+	// feature `polyci check` needs to categorize but that has no downside
+	// worth calling out on its own (Supported) — for `polyci check` to
+	// report. Populating this never changes what Run executes; it's purely
 	// informational. A parser that finds nothing to flag leaves this nil.
 	Findings []Finding
+	// SkippedJobs lists every job the parser recognized in the config but
+	// could not turn into anything runnable at all — e.g. a GitHub Actions
+	// job with no container:, or a CircleCI job referencing an orb-based
+	// executor. These jobs are excluded from Jobs entirely (the DAG, the
+	// executor, and every other job's DependsOn never reference them), so
+	// every other job in the file still runs normally; SkippedJobs exists
+	// purely so `polyci run` and `polyci check` can report the omission
+	// clearly instead of it being silent. A job that depends (directly or
+	// transitively) on a skipped job is itself recorded here too, with a
+	// reason that says so.
+	SkippedJobs []SkippedJob
+}
+
+// SkippedJob is one job Pipeline.SkippedJobs explains the absence of.
+type SkippedJob struct {
+	Name   string
+	Reason string
 }
 
 // FindingLevel classifies how faithfully PolyCI handles a recognized
@@ -31,6 +50,15 @@ const (
 	// at all; its presence may cause the job to behave differently than
 	// it would on the real provider.
 	Unsupported
+	// Supported means the feature was recognized and handled faithfully.
+	// Most fully-supported features never need a Finding at all — this
+	// exists only for `polyci check`'s category breakdown, where a
+	// category needs positive evidence a feature was both used and
+	// resolved cleanly (e.g. a GitHub Actions ${{ }} expression that
+	// substituted successfully), which a features's mere absence from the
+	// Emulated/Unsupported lists can't distinguish from that category
+	// never being used at all.
+	Supported
 )
 
 // String returns a short label for the level, used in `polyci check`'s
@@ -41,6 +69,8 @@ func (l FindingLevel) String() string {
 		return "Emulated"
 	case Unsupported:
 		return "Unsupported"
+	case Supported:
+		return "Supported"
 	default:
 		return "Unknown"
 	}

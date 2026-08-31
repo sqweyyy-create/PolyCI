@@ -69,5 +69,12 @@ func printPlan(w io.Writer, file string, p *pipeline.Pipeline) error {
 		fmt.Fprintln(w, "\nLevels run one after another; jobs within the same level run in parallel.")
 	}
 
+	if len(p.SkippedJobs) > 0 {
+		fmt.Fprintf(w, "\n%d job(s) skipped (not runnable at all) — run `polyci check` for why:\n", len(p.SkippedJobs))
+		for _, sj := range p.SkippedJobs {
+			fmt.Fprintf(w, "  - %s: %s\n", sj.Name, sj.Reason)
+		}
+	}
+
 	return nil
 }

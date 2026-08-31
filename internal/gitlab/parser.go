@@ -159,7 +159,10 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			stage = s
 		}
 		if !contains(p.Stages, stage) {
-			return nil, fmt.Errorf("job %q: stage %q is not declared in stages", key, stage)
+			p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{
+				Name: key, Reason: fmt.Sprintf("stage %q is not declared in stages", stage),
+			})
+			continue
 		}
 
 		image := defaultImage
@@ -170,12 +173,18 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			image = imageName(img)
 		}
 		if image == "" {
-			return nil, fmt.Errorf("job %q: no image specified (set image:, default.image, or top-level image:)", key)
+			p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{
+				Name: key, Reason: "no image specified (set image:, default.image, or top-level image:)",
+			})
+			continue
 		}
 
 		script := toStringSlice(raw["script"])
 		if len(script) == 0 {
-			return nil, fmt.Errorf("job %q: script is required and must not be empty", key)
+			p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{
+				Name: key, Reason: "script is required and must not be empty",
+			})
+			continue
 		}
 
 		before := defaultBefore
@@ -208,7 +217,10 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		if sv, ok := raw["services"]; ok {
 			svcs, err := parseServices(sv)
 			if err != nil {
-				return nil, fmt.Errorf("job %q: services: %w", key, err)
+				p.SkippedJobs = append(p.SkippedJobs, pipeline.SkippedJob{
+					Name: key, Reason: fmt.Sprintf("services: %v", err),
+				})
+				continue
 			}
 			services = svcs
 		}
@@ -234,7 +246,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		})
 	}
 
-	if len(p.Jobs) == 0 {
+	if len(p.Jobs) == 0 && len(p.SkippedJobs) == 0 {
 		return nil, fmt.Errorf("no runnable jobs found in config")
 	}
 

@@ -58,7 +58,10 @@ func TestParseSimple(t *testing.T) {
 	}
 }
 
-func TestParseMissingStage(t *testing.T) {
+// TestParseMissingStageIsSkipped proves a job whose stage: isn't declared
+// in stages: is skipped, not a fatal parse error for the whole file — it's
+// the only job here, so Parse still succeeds with zero runnable jobs.
+func TestParseMissingStageIsSkipped(t *testing.T) {
 	data := []byte(`
 stages: [build]
 job1:
@@ -66,28 +69,82 @@ job1:
   image: alpine
   script: [echo hi]
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for undeclared stage, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with job1 recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "job1" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for job1", p.SkippedJobs)
 	}
 }
 
-func TestParseMissingImage(t *testing.T) {
+func TestParseMissingImageIsSkipped(t *testing.T) {
 	data := []byte(`
 job1:
   script: [echo hi]
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for missing image, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with job1 recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "job1" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for job1", p.SkippedJobs)
 	}
 }
 
-func TestParseMissingScript(t *testing.T) {
+func TestParseMissingScriptIsSkipped(t *testing.T) {
 	data := []byte(`
 job1:
   image: alpine
 `)
-	if _, err := Parse(data); err == nil {
-		t.Fatal("expected error for missing script, got nil")
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with job1 recorded as skipped", err)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "job1" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for job1", p.SkippedJobs)
+	}
+}
+
+// TestParsePartialExecutionSkipsOnlyUnsupportedJob proves the core
+// partial-execution behavior for GitLab: a file with three runnable jobs
+// and one job that can't run at all (an undeclared stage) still runs the
+// three, with the fourth clearly recorded as skipped rather than the whole
+// file failing to parse.
+func TestParsePartialExecutionSkipsOnlyUnsupportedJob(t *testing.T) {
+	data := []byte(`
+stages: [build, test]
+build:
+  stage: build
+  image: alpine
+  script: [echo build]
+test:
+  stage: test
+  image: alpine
+  script: [echo test]
+lint:
+  stage: test
+  image: alpine
+  script: [echo lint]
+ghost:
+  stage: nonexistent-stage
+  image: alpine
+  script: [echo ghost]
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v, want success with ghost recorded as skipped", err)
+	}
+
+	gotJobs := map[string]bool{}
+	for _, j := range p.Jobs {
+		gotJobs[j.Name] = true
+	}
+	if len(p.Jobs) != 3 || !gotJobs["build"] || !gotJobs["test"] || !gotJobs["lint"] {
+		t.Fatalf("Jobs = %+v, want exactly build, test, lint", p.Jobs)
+	}
+	if len(p.SkippedJobs) != 1 || p.SkippedJobs[0].Name != "ghost" {
+		t.Fatalf("SkippedJobs = %+v, want a single entry for ghost", p.SkippedJobs)
 	}
 }
 
