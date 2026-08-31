@@ -1,7 +1,11 @@
 package githubactions
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
@@ -169,24 +173,24 @@ jobs:
 	}
 }
 
-// TestParseFindingsClassifyUsesExpressionsAndMatrix proves the features
-// this parser knowingly doesn't fully implement — third-party uses:
-// actions, unevaluated ${{ }} expressions, and strategy.matrix: — are
-// recorded as Findings for `polyci check` rather than silently passed
-// through or dropped. actions/checkout is Emulated (the workspace mount is
-// a real substitute); everything else here is Unsupported.
-func TestParseFindingsClassifyUsesExpressionsAndMatrix(t *testing.T) {
+// TestParseFindingsClassifyUsesAndExpressions proves the features this
+// parser knowingly doesn't fully implement — third-party uses: actions and
+// an unsupported ${{ }} expression — are recorded as Findings for `polyci
+// check` rather than silently passed through or dropped. actions/checkout
+// is Emulated (the workspace mount is a real substitute); everything else
+// here is Unsupported. (matrix. and github.sha/ref expressions are
+// genuinely evaluated now — see TestParseExpression* and
+// TestParseMatrixExpansion* — so this test uses secrets.TOKEN, which stays
+// unsupported, as its "unrecognized expression" example.)
+func TestParseFindingsClassifyUsesAndExpressions(t *testing.T) {
 	data := []byte(`
 jobs:
   build:
     container: alpine:3.19
-    strategy:
-      matrix:
-        version: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-      - run: echo "building ${{ github.sha }}"
+      - run: echo "token is ${{ secrets.TOKEN }}"
       - run: echo hi
 `)
 	p, err := Parse(data)
@@ -194,7 +198,7 @@ jobs:
 		t.Fatalf("Parse: %v", err)
 	}
 
-	var checkoutFinding, setupGoFinding, exprFinding, matrixFinding *pipeline.Finding
+	var checkoutFinding, setupGoFinding, exprFinding *pipeline.Finding
 	for i := range p.Findings {
 		f := &p.Findings[i]
 		switch {
@@ -202,10 +206,8 @@ jobs:
 			checkoutFinding = f
 		case f.Feature == "actions/setup-go@v5":
 			setupGoFinding = f
-		case f.Feature == "${{ }}":
+		case f.Feature == "${{ secrets.TOKEN }}":
 			exprFinding = f
-		case f.Feature == "strategy.matrix:":
-			matrixFinding = f
 		}
 	}
 
@@ -224,17 +226,14 @@ jobs:
 	}
 
 	if exprFinding == nil {
-		t.Fatalf("Findings = %+v, want a finding for the ${{ }} expression", p.Findings)
+		t.Fatalf("Findings = %+v, want a finding for the unsupported secrets.TOKEN expression", p.Findings)
 	}
 	if exprFinding.Job != "build" || exprFinding.Level != pipeline.Unsupported {
 		t.Errorf("expression finding = %+v, want Job=build Level=Unsupported", exprFinding)
 	}
-
-	if matrixFinding == nil {
-		t.Fatalf("Findings = %+v, want a finding for strategy.matrix:", p.Findings)
-	}
-	if matrixFinding.Job != "build" || matrixFinding.Level != pipeline.Unsupported {
-		t.Errorf("matrix finding = %+v, want Job=build Level=Unsupported", matrixFinding)
+	wantCommand := `echo "token is ${{ secrets.TOKEN }}"`
+	if p.Jobs[0].Steps[2].Command != wantCommand {
+		t.Errorf("unsupported expression's command = %q, want %q (left unexpanded)", p.Jobs[0].Steps[2].Command, wantCommand)
 	}
 
 	// The plain `run: echo hi` step (no expression) must not produce a finding.
@@ -242,6 +241,69 @@ jobs:
 		if f.Step == "run[3]" {
 			t.Errorf("unexpected finding for a plain run: step: %+v", f)
 		}
+	}
+}
+
+// TestParseMatrixExpansionProducesOneJobPerCombination proves a job with a
+// strategy.matrix is actually expanded into one job per combination — not
+// left as a single job with an "unsupported" finding — and that each
+// expanded job's steps have the matching matrix.<key> substitution baked
+// in, not the same literal text repeated.
+func TestParseMatrixExpansionProducesOneJobPerCombination(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    strategy:
+      matrix:
+        node: [18, 20]
+    steps:
+      - run: echo "node version is ${{ matrix.node }}"
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Jobs) != 2 {
+		t.Fatalf("got %d jobs, want 2 (one per matrix combination): %+v", len(p.Jobs), p.Jobs)
+	}
+
+	got := map[string]string{} // job name -> step command
+	for _, j := range p.Jobs {
+		if len(j.Steps) != 1 {
+			t.Fatalf("job %q steps = %+v, want 1", j.Name, j.Steps)
+		}
+		got[j.Name] = j.Steps[0].Command
+	}
+
+	if got["build (node=18)"] != `echo "node version is 18"` {
+		t.Errorf(`job "build (node=18)" command = %q, want %q`, got["build (node=18)"], `echo "node version is 18"`)
+	}
+	if got["build (node=20)"] != `echo "node version is 20"` {
+		t.Errorf(`job "build (node=20)" command = %q, want %q`, got["build (node=20)"], `echo "node version is 20"`)
+	}
+}
+
+// TestParseExpressionEnvSubstitution proves ${{ env.KEY }} substitutes
+// from the job's own resolved env (workflow-level env: merged with the
+// job's own env:), not left as literal unexpanded text.
+func TestParseExpressionEnvSubstitution(t *testing.T) {
+	data := []byte(`
+env:
+  GREETING: hello-from-workflow
+jobs:
+  build:
+    container: alpine:3.19
+    steps:
+      - run: echo "${{ env.GREETING }}"
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := `echo "hello-from-workflow"`
+	if got := p.Jobs[0].Steps[0].Command; got != want {
+		t.Errorf("Command = %q, want %q", got, want)
 	}
 }
 
@@ -274,5 +336,102 @@ jobs:
 	}
 	if steps[1].Shell != "" || steps[1].WorkingDirectory != "" {
 		t.Errorf("steps[1] = %+v, want Shell and WorkingDirectory left empty (no shell:/working-directory: set)", steps[1])
+	}
+}
+
+// initGitRepo creates a throwaway git repository at a fixed branch name
+// (so the test doesn't depend on the environment's init.defaultBranch),
+// with one commit, and returns its directory and HEAD's commit sha.
+func initGitRepo(t *testing.T) (dir, sha string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available, skipping test that needs a real repository")
+	}
+	dir = t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("checkout", "-q", "-b", "polyci-test")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-q", "-m", "init")
+
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, strings.TrimSpace(string(out))
+}
+
+// TestParseExpressionGithubShaAndRef proves ${{ github.sha }} and
+// ${{ github.ref }} substitute from the real local git repository at the
+// workspace root — the same directory the executor bind-mounts at
+// /workspace — rather than being left unevaluated.
+func TestParseExpressionGithubShaAndRef(t *testing.T) {
+	dir, sha := initGitRepo(t)
+
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    steps:
+      - run: echo "sha=${{ github.sha }} ref=${{ github.ref }}"
+`)
+	p, err := parseInDir(data, dir)
+	if err != nil {
+		t.Fatalf("parseInDir: %v", err)
+	}
+	want := fmt.Sprintf("echo \"sha=%s ref=refs/heads/polyci-test\"", sha)
+	if got := p.Jobs[0].Steps[0].Command; got != want {
+		t.Errorf("Command = %q, want %q", got, want)
+	}
+	for _, f := range p.Findings {
+		if strings.Contains(f.Feature, "github.sha") || strings.Contains(f.Feature, "github.ref") {
+			t.Errorf("unexpected finding for a successfully-substituted expression: %+v", f)
+		}
+	}
+}
+
+// TestParseExpressionGithubShaFallsBackToEmptyOutsideGitRepo proves that
+// when the workspace isn't a git repository at all, github.sha/github.ref
+// fall back to an empty string (rather than erroring or leaving the
+// literal "${{ github.sha }}" text for the shell to choke on) and that
+// fallback is surfaced as a Finding.
+func TestParseExpressionGithubShaFallsBackToEmptyOutsideGitRepo(t *testing.T) {
+	dir := t.TempDir() // deliberately not a git repository
+
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    steps:
+      - run: echo "sha=[${{ github.sha }}]"
+`)
+	p, err := parseInDir(data, dir)
+	if err != nil {
+		t.Fatalf("parseInDir: %v", err)
+	}
+	want := `echo "sha=[]"`
+	if got := p.Jobs[0].Steps[0].Command; got != want {
+		t.Errorf("Command = %q, want %q (empty-string fallback)", got, want)
+	}
+
+	found := false
+	for _, f := range p.Findings {
+		if f.Feature == "${{ github.sha }}" && f.Level == pipeline.Unsupported {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Findings = %+v, want a finding warning github.sha fell back to empty (no git repository)", p.Findings)
 	}
 }

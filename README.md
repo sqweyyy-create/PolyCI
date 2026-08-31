@@ -250,6 +250,52 @@ else (`pwsh`, `python`, `cmd`, a custom `command {0}` form) is a clear
 error rather than a silent fallback to `sh`. `working-directory:` may
 be relative (resolved against `/workspace`) or absolute.
 
+A small, deliberately minimal subset of `${{ }}` expression syntax is
+also evaluated — everything else in the real GitHub expression
+language (functions like `contains()`, `secrets.*`, `needs.*.outputs`,
+`steps.*`, etc.) is left as the literal, unexpanded text and reported
+by [`polyci check`](#checking-compatibility) as an unsupported
+expression rather than silently passed through or guessed at:
+
+- `${{ matrix.<key> }}` — substituted from the job's own
+  `strategy.matrix`; see matrix expansion below.
+- `${{ env.<KEY> }}` — substituted from the workflow/job's own `env:`.
+- `${{ github.sha }}` / `${{ github.ref }}` — substituted from the
+  local git repository at the workspace root (`git rev-parse HEAD`
+  and the current branch's full ref). Falls back to an empty string
+  (with a Finding, not silently) if the workspace isn't a git
+  repository, or (for `github.ref` only) if `HEAD` is detached.
+
+A job's `strategy.matrix:` is expanded into one job per combination —
+each combination is scheduled and runs independently, with
+`${{ matrix.<key> }}` substituted per-job — rather than running the
+job once with the matrix ignored:
+
+```yaml
+jobs:
+  build:
+    container: node:20
+    strategy:
+      matrix:
+        node: [18, 20]
+    steps:
+      - run: echo "testing on node ${{ matrix.node }}"
+```
+
+```sh
+$ polyci plan -provider github-actions -f .github/workflows/ci.yml
+Plan for .github/workflows/ci.yml (2 job(s)):
+
+Level 0 (parallel): build (node=18), build (node=20)
+  - build (node=18) [stage=level-0 image=node:20] depends on: (none)
+  - build (node=20) [stage=level-0 image=node:20] depends on: (none)
+```
+
+A job that `needs:` a matrix job waits for every one of its
+combinations. `matrix.include:`/`matrix.exclude:` aren't applied —
+only the cartesian product of list-valued matrix keys is expanded —
+and a Finding notes that explicitly when either is present.
+
 ### Service containers
 
 Jobs that need a database or other backing service can declare one —
@@ -338,12 +384,19 @@ omitted, the same default-from-image-name rule as GitLab).
   container, and approximating that with a Docker image (as `act`
   does, with its own curated image set) is out of scope; a job
   without `container:` fails to parse with a clear error rather than
-  silently doing nothing. It doesn't evaluate `${{ }}` expressions
-  (github/env/matrix context, etc.) — any that appear in `run:` are
-  passed through to the shell literally, which will usually error —
-  and doesn't expand `strategy: matrix:` (each job runs once, exactly
-  as written) or `uses:` a local/composite action. Only one workflow
-  file is run per invocation, not every file in that directory. A
+  silently doing nothing. Only a small, deliberately minimal subset of
+  `${{ }}` expression syntax is evaluated — `matrix.<key>`, `env.<KEY>`,
+  `github.sha`, and `github.ref` (see
+  [Running a pipeline](#running-a-pipeline) above) — everything else
+  (functions like `contains()`, `secrets.*`, `needs.*.outputs`,
+  `steps.*`) is left as literal, unexpanded text and reported by
+  `polyci check` as an unsupported expression rather than silently
+  passed through (which would usually just error in the shell) or
+  guessed at. `strategy: matrix:` is expanded into one job per
+  combination for list-valued matrix keys, but `matrix.include:` and
+  `matrix.exclude:` aren't applied. It doesn't support `uses:` a
+  local/composite action. Only one workflow file is run per
+  invocation, not every file in that directory. A
   step's `shell:` and `working-directory:` are honored (see
   [Running a pipeline](#running-a-pipeline) above), but only `sh` and
   `bash` are supported shells — `pwsh`, `python`, `cmd`, and the

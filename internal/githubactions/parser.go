@@ -13,7 +13,6 @@ package githubactions
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -21,13 +20,6 @@ import (
 	"github.com/sqweyyy-create/PolyCI/internal/dag"
 	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
-
-// expressionPattern matches GitHub Actions' `${{ ... }}` expression syntax
-// inside a run: command. We don't evaluate these (no access to GitHub's
-// contexts — github., secrets., steps., etc.), so a command containing one
-// runs with the literal, unexpanded text — a Finding makes that visible
-// instead of it silently producing the wrong command.
-var expressionPattern = regexp.MustCompile(`\$\{\{.*?\}\}`)
 
 // noOpUsesPrefixes are `uses:` actions we don't execute (running arbitrary
 // third-party actions is out of scope — that's `act`'s job). Rather than
@@ -38,11 +30,26 @@ var noOpUsesPrefixes = []string{
 }
 
 // Parse converts raw GitHub Actions workflow YAML bytes into a
-// provider-agnostic pipeline.Pipeline. Job `needs:` dependencies are
-// resolved into dependency levels, which become the pipeline's stages so
-// independent jobs at the same level run before anything that depends on
-// them.
+// provider-agnostic pipeline.Pipeline, resolving expressions and expanding
+// matrix jobs against the git repository at the current working
+// directory — the same directory that becomes /workspace when the pipeline
+// runs, since the executor always bind-mounts the process's cwd there.
 func Parse(data []byte) (*pipeline.Pipeline, error) {
+	return parseInDir(data, ".")
+}
+
+// parseInDir is Parse's actual implementation, taking the directory
+// github.sha/github.ref are read from explicitly — a separate entry point
+// so tests can point it at a throwaway git repository without touching the
+// process's real working directory.
+//
+// Job `needs:` dependencies are resolved into dependency levels, which
+// become the pipeline's stages so independent jobs at the same level run
+// before anything that depends on them. A job with a strategy.matrix
+// expands into one job per combination before dependency levels are
+// computed, and a job that `needs:` a matrix job depends on every one of
+// its combinations.
+func parseInDir(data []byte, dir string) (*pipeline.Pipeline, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("invalid YAML: %w", err)
@@ -72,18 +79,48 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 		return nil, fmt.Errorf("jobs: must be a mapping")
 	}
 
-	var nodes []dag.Node
+	git := loadGitInfo(dir)
+
+	// Each raw job in jobs: (a "base name") expands into one or more
+	// jobDefs (more than one only if it has a strategy.matrix). expansions
+	// records which final, unique job names a base name produced, so a
+	// needs: reference to a base name can be resolved into the full list
+	// of jobs it now actually depends on.
 	defs := map[string]jobDef{}
-	needsByName := map[string][]string{}
+	expansions := map[string][]string{}
+	baseNeeds := map[string][]string{}
+	var baseNames []string
 	for i := 0; i+1 < len(jobsNode.Content); i += 2 {
-		name := jobsNode.Content[i].Value
-		def, needs, err := parseJob(name, jobsNode.Content[i+1], globalEnv)
+		baseName := jobsNode.Content[i].Value
+		jobDefs, needs, err := parseJob(baseName, jobsNode.Content[i+1], globalEnv, git)
 		if err != nil {
-			return nil, fmt.Errorf("job %q: %w", name, err)
+			return nil, fmt.Errorf("job %q: %w", baseName, err)
 		}
-		defs[name] = def
-		needsByName[name] = needs
-		nodes = append(nodes, dag.Node{Name: name, Depends: needs})
+		names := make([]string, len(jobDefs))
+		for j, d := range jobDefs {
+			defs[d.name] = d
+			names[j] = d.name
+		}
+		expansions[baseName] = names
+		baseNeeds[baseName] = needs
+		baseNames = append(baseNames, baseName)
+	}
+
+	var nodes []dag.Node
+	needsByName := map[string][]string{}
+	for _, baseName := range baseNames {
+		for _, name := range expansions[baseName] {
+			var resolved []string
+			for _, needBase := range baseNeeds[baseName] {
+				needNames, ok := expansions[needBase]
+				if !ok {
+					return nil, fmt.Errorf("job %q: needs: references unknown job %q", baseName, needBase)
+				}
+				resolved = append(resolved, needNames...)
+			}
+			needsByName[name] = resolved
+			nodes = append(nodes, dag.Node{Name: name, Depends: resolved})
+		}
 	}
 
 	levels, order, err := dag.Levels(nodes)
@@ -121,78 +158,107 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 	return p, nil
 }
 
+// jobDef is one concrete, fully-resolved job — for a job with no
+// strategy.matrix, parseJob produces exactly one; for a job with an N-way
+// matrix, it produces N, one per combination, each with its own name.
 type jobDef struct {
+	name     string
 	image    string
 	env      map[string]string
 	steps    []pipeline.Step
 	findings []pipeline.Finding
 }
 
-func parseJob(jobName string, node *yaml.Node, globalEnv map[string]string) (jobDef, []string, error) {
+// parseJob parses one raw job entry into one jobDef per matrix combination
+// (or a single jobDef if it has no strategy.matrix), substituting
+// matrix./env./github. expressions in its image, env values, and steps
+// along the way. It returns the job's own (still base-name) needs: list —
+// the caller resolves that against every other job's own expansion, since
+// a matrix job's dependents must wait for all of its combinations.
+func parseJob(jobName string, node *yaml.Node, globalEnv map[string]string, git gitInfo) ([]jobDef, []string, error) {
 	raw, ok := decodeInterface(node).(map[string]interface{})
 	if !ok {
-		return jobDef{}, nil, fmt.Errorf("must be a mapping")
+		return nil, nil, fmt.Errorf("must be a mapping")
 	}
 
-	image, err := jobImage(raw)
+	rawImage, err := jobImage(raw)
 	if err != nil {
-		return jobDef{}, nil, err
+		return nil, nil, err
 	}
 
-	env := map[string]string{}
+	baseEnv := map[string]string{}
 	for k, v := range globalEnv {
-		env[k] = v
+		baseEnv[k] = v
 	}
 	for k, v := range toStringMap(raw["env"]) {
-		env[k] = v
+		baseEnv[k] = v
 	}
 	if c, ok := raw["container"].(map[string]interface{}); ok {
 		for k, v := range toStringMap(c["env"]) {
-			env[k] = v
+			baseEnv[k] = v
 		}
 	}
 
 	stepsRaw, ok := raw["steps"]
 	if !ok {
-		return jobDef{}, nil, fmt.Errorf("no steps defined")
+		return nil, nil, fmt.Errorf("no steps defined")
 	}
 	stepsList, ok := stepsRaw.([]interface{})
 	if !ok {
-		return jobDef{}, nil, fmt.Errorf("steps must be a list")
+		return nil, nil, fmt.Errorf("steps must be a list")
 	}
 
-	var steps []pipeline.Step
-	var findings []pipeline.Finding
-	for idx, item := range stepsList {
-		stepRaw, ok := item.(map[string]interface{})
-		if !ok {
-			return jobDef{}, nil, fmt.Errorf("step %d: must be a mapping", idx)
+	combos, hasMatrix, matrixFindings := matrixCombinations(jobName, raw)
+
+	var defs []jobDef
+	for i, combo := range combos {
+		name := jobName
+		if hasMatrix && len(combo) > 0 {
+			name = fmt.Sprintf("%s (%s)", jobName, comboLabel(combo))
 		}
-		step, finding, err := parseStep(jobName, idx, stepRaw)
-		if err != nil {
-			return jobDef{}, nil, err
+
+		var findings []pipeline.Finding
+		if i == 0 {
+			// Job-level findings (e.g. matrix.include:/exclude:) apply to
+			// the job as a whole, not to any one combination — attach them
+			// once rather than duplicating across every combination.
+			findings = append(findings, matrixFindings...)
 		}
-		steps = append(steps, step)
-		if finding != nil {
-			findings = append(findings, *finding)
+
+		ctx := exprContext{matrix: combo, git: git}
+
+		image, fs := substituteExpressions(rawImage, name, "", ctx)
+		findings = append(findings, fs...)
+
+		env := make(map[string]string, len(baseEnv))
+		for k, v := range baseEnv {
+			sv, fs := substituteExpressions(v, name, "", ctx)
+			env[k] = sv
+			findings = append(findings, fs...)
 		}
-	}
-	if len(steps) == 0 {
-		return jobDef{}, nil, fmt.Errorf("steps must not be empty")
+		ctx.env = env
+
+		var steps []pipeline.Step
+		for idx, item := range stepsList {
+			stepRaw, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, nil, fmt.Errorf("step %d: must be a mapping", idx)
+			}
+			step, stepFindings, err := parseStep(name, idx, stepRaw, ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			steps = append(steps, step)
+			findings = append(findings, stepFindings...)
+		}
+		if len(steps) == 0 {
+			return nil, nil, fmt.Errorf("steps must not be empty")
+		}
+
+		defs = append(defs, jobDef{name: name, image: image, env: env, steps: steps, findings: findings})
 	}
 
-	if strategy, ok := raw["strategy"].(map[string]interface{}); ok {
-		if _, ok := strategy["matrix"]; ok {
-			findings = append(findings, pipeline.Finding{
-				Job:     jobName,
-				Feature: "strategy.matrix:",
-				Level:   pipeline.Unsupported,
-				Detail:  "matrix builds are not expanded; the job runs once with its literal (unsubstituted) config",
-			})
-		}
-	}
-
-	return jobDef{image: image, env: env, steps: steps, findings: findings}, toStringSlice(raw["needs"]), nil
+	return defs, toStringSlice(raw["needs"]), nil
 }
 
 func jobImage(raw map[string]interface{}) (string, error) {
@@ -216,12 +282,12 @@ func jobImage(raw map[string]interface{}) (string, error) {
 	return "", fmt.Errorf("container: has an unsupported format")
 }
 
-func parseStep(jobName string, idx int, raw map[string]interface{}) (pipeline.Step, *pipeline.Finding, error) {
+func parseStep(jobName string, idx int, raw map[string]interface{}, ctx exprContext) (pipeline.Step, []pipeline.Finding, error) {
 	name, _ := raw["name"].(string)
 
 	if runVal, ok := raw["run"]; ok {
-		command, ok := runVal.(string)
-		if !ok || command == "" {
+		rawCommand, ok := runVal.(string)
+		if !ok || rawCommand == "" {
 			return pipeline.Step{}, nil, fmt.Errorf("step %d: run: must be a non-empty string", idx)
 		}
 		if name == "" {
@@ -229,24 +295,30 @@ func parseStep(jobName string, idx int, raw map[string]interface{}) (pipeline.St
 		}
 		shell, _ := raw["shell"].(string)
 		workingDir, _ := raw["working-directory"].(string)
+
+		var findings []pipeline.Finding
+		command, fs := substituteExpressions(rawCommand, jobName, name, ctx)
+		findings = append(findings, fs...)
+
+		env := toStringMap(raw["env"])
+		if env != nil {
+			expandedEnv := make(map[string]string, len(env))
+			for k, v := range env {
+				sv, fs := substituteExpressions(v, jobName, name, ctx)
+				expandedEnv[k] = sv
+				findings = append(findings, fs...)
+			}
+			env = expandedEnv
+		}
+
 		step := pipeline.Step{
 			Name:             name,
 			Command:          command,
-			Env:              toStringMap(raw["env"]),
+			Env:              env,
 			Shell:            shell,
 			WorkingDirectory: workingDir,
 		}
-		var finding *pipeline.Finding
-		if expressionPattern.MatchString(command) {
-			finding = &pipeline.Finding{
-				Job:     jobName,
-				Step:    name,
-				Feature: "${{ }}",
-				Level:   pipeline.Unsupported,
-				Detail:  "expression syntax is not evaluated; the step runs with the literal, unexpanded text",
-			}
-		}
-		return step, finding, nil
+		return step, findings, nil
 	}
 
 	if usesVal, ok := raw["uses"]; ok {
@@ -255,7 +327,7 @@ func parseStep(jobName string, idx int, raw map[string]interface{}) (pipeline.St
 			return pipeline.Step{}, nil, fmt.Errorf("step %d: uses: must be a non-empty string", idx)
 		}
 		step, finding := noOpStep(jobName, idx, action)
-		return step, &finding, nil
+		return step, []pipeline.Finding{finding}, nil
 	}
 
 	return pipeline.Step{}, nil, fmt.Errorf("step %d: expected run: or uses:", idx)
