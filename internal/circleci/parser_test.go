@@ -3,6 +3,8 @@ package circleci
 import (
 	"os"
 	"testing"
+
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 func TestParseSimple(t *testing.T) {
@@ -237,5 +239,60 @@ jobs:
 	}
 	if services[1].Image != "redis:7" || services[1].Alias != "cache" || services[1].Variables["REDIS_PASSWORD"] != "secret" {
 		t.Errorf("services[1] = %+v", services[1])
+	}
+}
+
+// TestParseFindingsClassifyNoOpSteps proves checkout and other unsupported
+// builtin steps are recorded as Findings for `polyci check` — checkout as
+// Emulated (the workspace mount is a real substitute), the rest as
+// Unsupported (a pure no-op with no substitute) — not just silently
+// turned into a no-op step with no trace of what was skipped.
+func TestParseFindingsClassifyNoOpSteps(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    docker: [{image: alpine:3.19}]
+    steps:
+      - checkout
+      - save_cache:
+          key: v1
+          paths: [~/cache]
+      - run: echo hi
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	var checkoutFinding, saveCacheFinding *pipeline.Finding
+	for i := range p.Findings {
+		f := &p.Findings[i]
+		switch f.Feature {
+		case "checkout":
+			checkoutFinding = f
+		case "save_cache":
+			saveCacheFinding = f
+		}
+	}
+
+	if checkoutFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for checkout", p.Findings)
+	}
+	if checkoutFinding.Job != "build" || checkoutFinding.Level != pipeline.Emulated {
+		t.Errorf("checkout finding = %+v, want Job=build Level=Emulated", checkoutFinding)
+	}
+
+	if saveCacheFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for save_cache", p.Findings)
+	}
+	if saveCacheFinding.Job != "build" || saveCacheFinding.Level != pipeline.Unsupported {
+		t.Errorf("save_cache finding = %+v, want Job=build Level=Unsupported", saveCacheFinding)
+	}
+
+	// The run: step is fully supported and must not produce a finding.
+	for _, f := range p.Findings {
+		if f.Feature == "run" {
+			t.Errorf("unexpected finding for a plain run: step: %+v", f)
+		}
 	}
 }

@@ -13,6 +13,7 @@ package githubactions
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -20,6 +21,13 @@ import (
 	"github.com/sqweyyy-create/PolyCI/internal/dag"
 	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
+
+// expressionPattern matches GitHub Actions' `${{ ... }}` expression syntax
+// inside a run: command. We don't evaluate these (no access to GitHub's
+// contexts — github., secrets., steps., etc.), so a command containing one
+// runs with the literal, unexpanded text — a Finding makes that visible
+// instead of it silently producing the wrong command.
+var expressionPattern = regexp.MustCompile(`\$\{\{.*?\}\}`)
 
 // noOpUsesPrefixes are `uses:` actions we don't execute (running arbitrary
 // third-party actions is out of scope — that's `act`'s job). Rather than
@@ -69,7 +77,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 	needsByName := map[string][]string{}
 	for i := 0; i+1 < len(jobsNode.Content); i += 2 {
 		name := jobsNode.Content[i].Value
-		def, needs, err := parseJob(jobsNode.Content[i+1], globalEnv)
+		def, needs, err := parseJob(name, jobsNode.Content[i+1], globalEnv)
 		if err != nil {
 			return nil, fmt.Errorf("job %q: %w", name, err)
 		}
@@ -104,6 +112,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			Steps:     def.steps,
 			DependsOn: needsByName[name],
 		})
+		p.Findings = append(p.Findings, def.findings...)
 	}
 
 	if len(p.Jobs) == 0 {
@@ -113,12 +122,13 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 }
 
 type jobDef struct {
-	image string
-	env   map[string]string
-	steps []pipeline.Step
+	image    string
+	env      map[string]string
+	steps    []pipeline.Step
+	findings []pipeline.Finding
 }
 
-func parseJob(node *yaml.Node, globalEnv map[string]string) (jobDef, []string, error) {
+func parseJob(jobName string, node *yaml.Node, globalEnv map[string]string) (jobDef, []string, error) {
 	raw, ok := decodeInterface(node).(map[string]interface{})
 	if !ok {
 		return jobDef{}, nil, fmt.Errorf("must be a mapping")
@@ -152,22 +162,37 @@ func parseJob(node *yaml.Node, globalEnv map[string]string) (jobDef, []string, e
 	}
 
 	var steps []pipeline.Step
+	var findings []pipeline.Finding
 	for idx, item := range stepsList {
 		stepRaw, ok := item.(map[string]interface{})
 		if !ok {
 			return jobDef{}, nil, fmt.Errorf("step %d: must be a mapping", idx)
 		}
-		step, err := parseStep(idx, stepRaw)
+		step, finding, err := parseStep(jobName, idx, stepRaw)
 		if err != nil {
 			return jobDef{}, nil, err
 		}
 		steps = append(steps, step)
+		if finding != nil {
+			findings = append(findings, *finding)
+		}
 	}
 	if len(steps) == 0 {
 		return jobDef{}, nil, fmt.Errorf("steps must not be empty")
 	}
 
-	return jobDef{image: image, env: env, steps: steps}, toStringSlice(raw["needs"]), nil
+	if strategy, ok := raw["strategy"].(map[string]interface{}); ok {
+		if _, ok := strategy["matrix"]; ok {
+			findings = append(findings, pipeline.Finding{
+				Job:     jobName,
+				Feature: "strategy.matrix:",
+				Level:   pipeline.Unsupported,
+				Detail:  "matrix builds are not expanded; the job runs once with its literal (unsubstituted) config",
+			})
+		}
+	}
+
+	return jobDef{image: image, env: env, steps: steps, findings: findings}, toStringSlice(raw["needs"]), nil
 }
 
 func jobImage(raw map[string]interface{}) (string, error) {
@@ -191,46 +216,69 @@ func jobImage(raw map[string]interface{}) (string, error) {
 	return "", fmt.Errorf("container: has an unsupported format")
 }
 
-func parseStep(idx int, raw map[string]interface{}) (pipeline.Step, error) {
+func parseStep(jobName string, idx int, raw map[string]interface{}) (pipeline.Step, *pipeline.Finding, error) {
 	name, _ := raw["name"].(string)
 
 	if runVal, ok := raw["run"]; ok {
 		command, ok := runVal.(string)
 		if !ok || command == "" {
-			return pipeline.Step{}, fmt.Errorf("step %d: run: must be a non-empty string", idx)
+			return pipeline.Step{}, nil, fmt.Errorf("step %d: run: must be a non-empty string", idx)
 		}
 		if name == "" {
 			name = fmt.Sprintf("run[%d]", idx)
 		}
-		return pipeline.Step{Name: name, Command: command, Env: toStringMap(raw["env"])}, nil
+		step := pipeline.Step{Name: name, Command: command, Env: toStringMap(raw["env"])}
+		var finding *pipeline.Finding
+		if expressionPattern.MatchString(command) {
+			finding = &pipeline.Finding{
+				Job:     jobName,
+				Step:    name,
+				Feature: "${{ }}",
+				Level:   pipeline.Unsupported,
+				Detail:  "expression syntax is not evaluated; the step runs with the literal, unexpanded text",
+			}
+		}
+		return step, finding, nil
 	}
 
 	if usesVal, ok := raw["uses"]; ok {
 		action, _ := usesVal.(string)
 		if action == "" {
-			return pipeline.Step{}, fmt.Errorf("step %d: uses: must be a non-empty string", idx)
+			return pipeline.Step{}, nil, fmt.Errorf("step %d: uses: must be a non-empty string", idx)
 		}
-		return noOpStep(idx, action), nil
+		step, finding := noOpStep(jobName, idx, action)
+		return step, &finding, nil
 	}
 
-	return pipeline.Step{}, fmt.Errorf("step %d: expected run: or uses:", idx)
+	return pipeline.Step{}, nil, fmt.Errorf("step %d: expected run: or uses:", idx)
 }
 
 // noOpStep turns an unexecuted `uses:` action into a visible, harmless log
 // line rather than erroring or silently dropping it — see the "Known
 // limitations" note in CLAUDE.md.
-func noOpStep(idx int, action string) pipeline.Step {
+func noOpStep(jobName string, idx int, action string) (pipeline.Step, pipeline.Finding) {
+	level := pipeline.Unsupported
 	reason := fmt.Sprintf("uses: %s is not supported yet, skipping", action)
 	for _, prefix := range noOpUsesPrefixes {
 		if strings.HasPrefix(action, prefix) {
+			level = pipeline.Emulated
 			reason = fmt.Sprintf("uses: %s is a no-op: the repo is already mounted at /workspace", action)
 			break
 		}
 	}
-	return pipeline.Step{
-		Name:    fmt.Sprintf("uses[%d]", idx),
+	name := fmt.Sprintf("uses[%d]", idx)
+	step := pipeline.Step{
+		Name:    name,
 		Command: fmt.Sprintf("echo \"polyci: %s\"", reason),
 	}
+	finding := pipeline.Finding{
+		Job:     jobName,
+		Step:    name,
+		Feature: action,
+		Level:   level,
+		Detail:  reason,
+	}
+	return step, finding
 }
 
 func decodeInterface(node *yaml.Node) interface{} {

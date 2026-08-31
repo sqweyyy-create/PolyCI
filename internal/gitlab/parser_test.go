@@ -3,6 +3,8 @@ package gitlab
 import (
 	"os"
 	"testing"
+
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 func TestParseSimple(t *testing.T) {
@@ -161,5 +163,165 @@ job2:
 	svc := job2.Services[0]
 	if svc.Image != "redis:7" || svc.Alias != "cache" || svc.Variables["REDIS_PASSWORD"] != "secret" {
 		t.Errorf("job2 service = %+v", svc)
+	}
+}
+
+// TestParsePagesJobNotDropped proves a job literally named "pages" — an
+// entirely ordinary job name in real GitLab CI, not a config keyword —
+// is no longer silently dropped. See COMPATIBILITY.md.
+func TestParsePagesJobNotDropped(t *testing.T) {
+	data := []byte(`
+pages:
+  image: alpine
+  script:
+    - echo "publishing pages"
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Jobs) != 1 || p.Jobs[0].Name != "pages" {
+		t.Fatalf("Jobs = %+v, want a single job named %q", p.Jobs, "pages")
+	}
+}
+
+// TestParseExtendsSingleLevelMerged proves extends: is no longer
+// silently ignored: a job extending a hidden template now inherits that
+// template's before_script/variables, and the merge is recorded as an
+// Emulated finding rather than passing through invisibly.
+func TestParseExtendsSingleLevelMerged(t *testing.T) {
+	data := []byte(`
+.base:
+  variables:
+    FROM_BASE: yes
+  before_script:
+    - echo setting up
+
+job1:
+  extends: .base
+  image: alpine
+  script:
+    - echo hi
+  variables:
+    JOB_OWN: yes
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1 (hidden .base must stay excluded): %+v", len(p.Jobs), p.Jobs)
+	}
+
+	job := p.Jobs[0]
+	if job.Variables["FROM_BASE"] != "yes" {
+		t.Errorf("job.Variables missing FROM_BASE inherited via extends: %+v", job.Variables)
+	}
+	if job.Variables["JOB_OWN"] != "yes" {
+		t.Errorf("job.Variables missing the job's own JOB_OWN: %+v", job.Variables)
+	}
+
+	wantSteps := []string{"echo setting up", "echo hi"}
+	if len(job.Steps) != len(wantSteps) {
+		t.Fatalf("job.Steps = %+v, want commands %v (before_script inherited via extends first)", job.Steps, wantSteps)
+	}
+	for i, cmd := range wantSteps {
+		if job.Steps[i].Command != cmd {
+			t.Errorf("Steps[%d].Command = %q, want %q", i, job.Steps[i].Command, cmd)
+		}
+	}
+
+	found := false
+	for _, f := range p.Findings {
+		if f.Job == "job1" && f.Feature == "extends:" && f.Level == pipeline.Emulated {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Findings = %+v, want an Emulated extends: finding for job1", p.Findings)
+	}
+}
+
+// TestParseExtendsDeepChainFlaggedUnsupported proves that a chain of
+// extends: deeper than one level is not silently accepted as if fully
+// resolved — it's flagged as Unsupported instead, since only the first
+// level actually gets merged.
+func TestParseExtendsDeepChainFlaggedUnsupported(t *testing.T) {
+	data := []byte(`
+.base:
+  before_script:
+    - echo from base
+
+.mid:
+  extends: .base
+  variables:
+    FROM_MID: yes
+
+job1:
+  extends: .mid
+  image: alpine
+  script:
+    - echo hi
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	found := false
+	for _, f := range p.Findings {
+		if f.Job == "job1" && f.Feature == "extends:" && f.Level == pipeline.Unsupported {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Findings = %+v, want an Unsupported extends: finding for job1 (chain deeper than one level)", p.Findings)
+	}
+}
+
+// TestParseExtendsThroughAnchorMerge reproduces the real-world pattern
+// found in fdroidclient's .gitlab-ci.yml (see COMPATIBILITY.md): a real
+// job doesn't write extends: itself, but merges in a hidden template via
+// a plain YAML anchor (<<: *template), and that template is the one that
+// uses extends:. Since the anchor merge is resolved natively by the YAML
+// decoder before PolyCI's own code runs, the real job's raw fields end up
+// containing that inherited extends: too — so single-level resolution is
+// enough to correctly reach the base template's before_script here.
+func TestParseExtendsThroughAnchorMerge(t *testing.T) {
+	data := []byte(`
+.base:
+  before_script:
+    - echo setting up
+
+.test-template: &test-template
+  extends: .base
+  stage: test
+
+job1:
+  <<: *test-template
+  image: alpine
+  script:
+    - echo hi
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1: %+v", len(p.Jobs), p.Jobs)
+	}
+
+	job := p.Jobs[0]
+	if job.Stage != "test" {
+		t.Errorf("job.Stage = %q, want %q (inherited from .test-template via the YAML anchor merge)", job.Stage, "test")
+	}
+	wantSteps := []string{"echo setting up", "echo hi"}
+	if len(job.Steps) != len(wantSteps) {
+		t.Fatalf("job.Steps = %+v, want commands %v (before_script inherited from .base through .test-template)", job.Steps, wantSteps)
+	}
+	for i, cmd := range wantSteps {
+		if job.Steps[i].Command != cmd {
+			t.Errorf("Steps[%d].Command = %q, want %q", i, job.Steps[i].Command, cmd)
+		}
 	}
 }

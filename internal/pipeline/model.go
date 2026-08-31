@@ -10,6 +10,52 @@ import "strings"
 type Pipeline struct {
 	Stages []string
 	Jobs   []Job
+	// Findings records config features the parser recognized as not
+	// fully faithful to the real provider — for `polyci check` to report.
+	// Populating this never changes what Run executes; it's purely
+	// informational. A parser that finds nothing to flag leaves this nil.
+	Findings []Finding
+}
+
+// FindingLevel classifies how faithfully PolyCI handles a recognized
+// config feature.
+type FindingLevel int
+
+const (
+	// Emulated means the feature was translated into something that
+	// approximates real behavior rather than faithfully implementing it —
+	// e.g. a no-op step standing in for a real checkout, since the
+	// workspace mount already puts the repo's files in place.
+	Emulated FindingLevel = iota
+	// Unsupported means the feature was recognized but isn't implemented
+	// at all; its presence may cause the job to behave differently than
+	// it would on the real provider.
+	Unsupported
+)
+
+// String returns a short label for the level, used in `polyci check`'s
+// output.
+func (l FindingLevel) String() string {
+	switch l {
+	case Emulated:
+		return "Emulated"
+	case Unsupported:
+		return "Unsupported"
+	default:
+		return "Unknown"
+	}
+}
+
+// Finding records one specific feature of the source config and how
+// faithfully PolyCI handles it. Job and Step name the location it was
+// found at; Step is empty for a job-level or pipeline-level finding (Job
+// is then also empty).
+type Finding struct {
+	Job     string
+	Step    string
+	Feature string
+	Level   FindingLevel
+	Detail  string
 }
 
 // Job is a single unit of work: run in one container, made of ordered steps.

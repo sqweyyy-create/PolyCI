@@ -14,8 +14,16 @@ import (
 // top-level `stages:` key.
 var defaultStages = []string{".pre", "build", "test", "deploy", ".post"}
 
-// reservedTopLevelKeys are keywords GitLab recognizes at the top level that
-// are never job definitions.
+// reservedTopLevelKeys are the config keywords GitLab actually recognizes
+// at the top level of a .gitlab-ci.yml — as opposed to keywords that only
+// exist at the job level (tags:, retry:, timeout:, interruptible:,
+// secrets:, parallel:, trigger:, inherit: are all job-only; their global
+// defaults live under default:, not as bare top-level keys). This list
+// must stay conservative: any name in it can never be used as a job name,
+// since it silently drops that job with no error — see the `pages`
+// regression this list previously caused (a job named exactly `pages`,
+// which is an entirely ordinary job name in real GitLab CI, was being
+// treated as a reserved keyword and dropped without a trace).
 var reservedTopLevelKeys = map[string]bool{
 	"stages":        true,
 	"variables":     true,
@@ -27,16 +35,6 @@ var reservedTopLevelKeys = map[string]bool{
 	"after_script":  true,
 	"cache":         true,
 	"services":      true,
-	"timeout":       true,
-	"retry":         true,
-	"tags":          true,
-	"interruptible": true,
-	"pages":         true,
-	"stages_order":  true,
-	"secrets":       true,
-	"parallel":      true,
-	"trigger":       true,
-	"inherit":       true,
 }
 
 // Parse converts raw .gitlab-ci.yml bytes into a provider-agnostic
@@ -106,7 +104,33 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 				return nil, fmt.Errorf("services: %w", err)
 			}
 			topServices = services
+		case "include":
+			p.Findings = append(p.Findings, pipeline.Finding{
+				Feature: "include:",
+				Level:   pipeline.Unsupported,
+				Detail:  "included files are not fetched or expanded; only jobs defined directly in this file are considered",
+			})
 		}
+	}
+
+	// Preliminary pass: decode every top-level entry that isn't a reserved
+	// keyword — hidden job templates (name starting with '.') included —
+	// so extends: can look up any of them by name below. Hidden templates
+	// are never themselves turned into runnable jobs (see the second pass),
+	// but a real job's extends: (or a template it's built from via a YAML
+	// anchor merge) can reference one.
+	allEntries := map[string]map[string]interface{}{}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i].Value
+		val := root.Content[i+1]
+		if reservedTopLevelKeys[key] || val.Kind != yaml.MappingNode {
+			continue
+		}
+		raw, err := decodeMap(val)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", key, err)
+		}
+		allEntries[key] = raw
 	}
 
 	// Second pass: job definitions, in file order.
@@ -125,9 +149,9 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 			continue
 		}
 
-		raw, err := decodeMap(val)
-		if err != nil {
-			return nil, fmt.Errorf("job %q: %w", key, err)
+		raw, extendsFinding := resolveExtends(key, allEntries[key], allEntries)
+		if extendsFinding != nil {
+			p.Findings = append(p.Findings, *extendsFinding)
 		}
 
 		stage := "test"
@@ -354,6 +378,99 @@ func parseServices(v interface{}) ([]pipeline.Service, error) {
 		}
 	}
 	return services, nil
+}
+
+// resolveExtends applies GitLab's extends: for a single level: the
+// referenced job's (or jobs', if a list) own fields become defaults for
+// this job, with this job's own fields taking precedence — variables: is
+// deep-merged (child's keys win per-key), everything else is a shallow
+// override, matching GitLab's own extends merge semantics. Only one
+// level is resolved: if a referenced job itself also has an unresolved
+// extends:, that isn't followed further, and the returned Finding notes
+// it explicitly rather than silently dropping it. Returns raw unchanged
+// (and a nil Finding) when there's no extends: at all.
+func resolveExtends(jobName string, raw map[string]interface{}, allEntries map[string]map[string]interface{}) (map[string]interface{}, *pipeline.Finding) {
+	extendsRaw, ok := raw["extends"]
+	if !ok {
+		return raw, nil
+	}
+
+	var parents []string
+	switch v := extendsRaw.(type) {
+	case string:
+		parents = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parents = append(parents, s)
+			}
+		}
+	}
+
+	merged := raw
+	var missing, deep []string
+	for _, parentName := range parents {
+		parent, ok := allEntries[parentName]
+		if !ok {
+			missing = append(missing, parentName)
+			continue
+		}
+		merged = mergeExtends(merged, parent)
+		if _, stillExtends := parent["extends"]; stillExtends {
+			deep = append(deep, parentName)
+		}
+	}
+
+	if len(missing) > 0 {
+		return merged, &pipeline.Finding{
+			Job:     jobName,
+			Feature: "extends:",
+			Level:   pipeline.Unsupported,
+			Detail:  fmt.Sprintf("references unknown job(s) %v", missing),
+		}
+	}
+	if len(deep) > 0 {
+		return merged, &pipeline.Finding{
+			Job:     jobName,
+			Feature: "extends:",
+			Level:   pipeline.Unsupported,
+			Detail:  fmt.Sprintf("only a single level of extends: is resolved; %v itself uses extends:, which is not followed", deep),
+		}
+	}
+	return merged, &pipeline.Finding{
+		Job:     jobName,
+		Feature: "extends:",
+		Level:   pipeline.Emulated,
+		Detail:  fmt.Sprintf("merged in %v (single level only — a chain of extends: beyond that isn't followed)", parents),
+	}
+}
+
+// mergeExtends layers child's own fields over parent's: variables: is
+// deep-merged (child's individual keys override parent's, the rest is
+// unioned), everything else is a shallow override — child wins outright
+// if it defines the key at all, otherwise parent's value is inherited.
+func mergeExtends(child, parent map[string]interface{}) map[string]interface{} {
+	merged := make(map[string]interface{}, len(parent)+len(child))
+	for k, v := range parent {
+		merged[k] = v
+	}
+	for k, v := range child {
+		if k == "variables" {
+			pv, _ := merged["variables"].(map[string]interface{})
+			cv, _ := v.(map[string]interface{})
+			out := make(map[string]interface{}, len(pv)+len(cv))
+			for kk, vv := range pv {
+				out[kk] = vv
+			}
+			for kk, vv := range cv {
+				out[kk] = vv
+			}
+			merged["variables"] = out
+		} else {
+			merged[k] = v
+		}
+	}
+	return merged
 }
 
 func contains(list []string, s string) bool {

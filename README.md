@@ -166,6 +166,40 @@ Level 1 (parallel): test, lint
 Levels run one after another; jobs within the same level run in parallel.
 ```
 
+### Checking compatibility
+
+`polyci check` parses a config and reports how faithfully PolyCI can
+run it — every job/step is classified as Supported, Emulated (handled,
+but not identically to the real provider — e.g. `checkout` is a no-op
+because the workspace is already mounted), or Unsupported (recognized
+but not implemented, which may change job behavior), followed by an
+estimated fidelity percentage. Like `plan`, it never touches Docker
+and never runs anything:
+
+```sh
+polyci check
+polyci check -provider circleci
+polyci check -provider github-actions -f .github/workflows/ci.yml
+```
+
+```
+Compatibility check for .circleci/config.yml (3 job(s), 6 step(s)):
+
+  Supported:   5
+  Emulated:    1
+  Unsupported: 0
+
+Emulated (approximated, not a faithful implementation):
+  - [build/checkout[0]] checkout: Emulated — checkout is a no-op: the repo is already mounted at /workspace
+
+Estimated fidelity: 100% (6/6 units fully supported or emulated; 0 unsupported)
+```
+
+Run this before `polyci run` on an unfamiliar real-world config to see
+what won't behave identically to the real provider — see
+[`COMPATIBILITY.md`](./COMPATIBILITY.md) for a compatibility pass
+against 15 real-world configs.
+
 ### Running a pipeline
 
 The same `polyci run` works across all three providers:
@@ -268,6 +302,13 @@ omitted, the same default-from-image-name rule as GitLab).
 - GitHub Actions' equivalent of service containers (a job's
   `services:`) isn't supported yet — only GitLab CI and CircleCI have
   it today (see [Service containers](#service-containers) above).
+- The GitLab parser resolves `extends:` one level deep (including
+  `variables:` deep-merging, everything else child-wins-if-present) —
+  a job extending another job that itself uses `extends:` only gets
+  that first level merged, not the full chain; `polyci check` flags
+  this case as Unsupported so it's visible rather than silently
+  under-merged. `include:` is recognized but not fetched or expanded —
+  only jobs defined directly in the file being parsed are considered.
 - The CircleCI parser only supports the `docker` executor (not
   `machine`, `macos`, or `windows`), doesn't expand `orbs:` or
   top-level `commands:`, and doesn't support aliasing a job to a

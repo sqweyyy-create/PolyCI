@@ -16,17 +16,19 @@ import (
 // repo checkout, workspace/cache/artifact persistence, etc.). Rather than
 // erroring on every real-world config that uses them, we turn them into a
 // visible no-op step so the log is honest about what didn't happen.
-var noOpStepTypes = map[string]bool{
-	"checkout":             true,
-	"setup_remote_docker":  true,
-	"persist_to_workspace": true,
-	"attach_workspace":     true,
-	"store_artifacts":      true,
-	"store_test_results":   true,
-	"save_cache":           true,
-	"restore_cache":        true,
-	"add_ssh_keys":         true,
-	"deploy":               true,
+// checkout is Emulated (the workspace mount is a real substitute for it);
+// everything else is Unsupported (a pure no-op with no real substitute).
+var noOpStepTypes = map[string]pipeline.FindingLevel{
+	"checkout":             pipeline.Emulated,
+	"setup_remote_docker":  pipeline.Unsupported,
+	"persist_to_workspace": pipeline.Unsupported,
+	"attach_workspace":     pipeline.Unsupported,
+	"store_artifacts":      pipeline.Unsupported,
+	"store_test_results":   pipeline.Unsupported,
+	"save_cache":           pipeline.Unsupported,
+	"restore_cache":        pipeline.Unsupported,
+	"add_ssh_keys":         pipeline.Unsupported,
+	"deploy":               pipeline.Unsupported,
 }
 
 // jobDef is a job as declared under the top-level `jobs:` key, before it's
@@ -36,6 +38,7 @@ type jobDef struct {
 	env      map[string]string
 	steps    []pipeline.Step
 	services []pipeline.Service
+	findings []pipeline.Finding
 }
 
 // workflowJobRef is one entry in a workflow's `jobs:` list: which job
@@ -123,6 +126,7 @@ func Parse(data []byte) (*pipeline.Pipeline, error) {
 				DependsOn: requiresByName[jobName],
 				Services:  def.services,
 			})
+			p.Findings = append(p.Findings, def.findings...)
 		}
 	}
 
@@ -244,7 +248,7 @@ func parseJobs(node *yaml.Node) (map[string]jobDef, error) {
 	defs := map[string]jobDef{}
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		name := node.Content[i].Value
-		def, err := parseJob(node.Content[i+1])
+		def, err := parseJob(name, node.Content[i+1])
 		if err != nil {
 			return nil, fmt.Errorf("job %q: %w", name, err)
 		}
@@ -253,7 +257,7 @@ func parseJobs(node *yaml.Node) (map[string]jobDef, error) {
 	return defs, nil
 }
 
-func parseJob(node *yaml.Node) (jobDef, error) {
+func parseJob(jobName string, node *yaml.Node) (jobDef, error) {
 	raw := map[string]interface{}{}
 	if err := node.Decode(&raw); err != nil {
 		return jobDef{}, err
@@ -274,18 +278,22 @@ func parseJob(node *yaml.Node) (jobDef, error) {
 	}
 
 	var steps []pipeline.Step
+	var findings []pipeline.Finding
 	for idx, item := range stepsList {
-		step, err := parseStep(idx, item)
+		step, finding, err := parseStep(jobName, idx, item)
 		if err != nil {
 			return jobDef{}, err
 		}
 		steps = append(steps, step)
+		if finding != nil {
+			findings = append(findings, *finding)
+		}
 	}
 	if len(steps) == 0 {
 		return jobDef{}, fmt.Errorf("steps must not be empty")
 	}
 
-	return jobDef{image: image, env: toStringMap(raw["environment"]), steps: steps, services: services}, nil
+	return jobDef{image: image, env: toStringMap(raw["environment"]), steps: steps, services: services, findings: findings}, nil
 }
 
 // jobImageAndServices reads a job's docker: list: the first entry is the
@@ -334,22 +342,23 @@ func jobImageAndServices(raw map[string]interface{}) (string, []pipeline.Service
 	return image, services, nil
 }
 
-func parseStep(idx int, item interface{}) (pipeline.Step, error) {
+func parseStep(jobName string, idx int, item interface{}) (pipeline.Step, *pipeline.Finding, error) {
 	switch v := item.(type) {
 	case string:
-		return noOpStep(idx, v)
+		return noOpStep(jobName, idx, v)
 	case map[string]interface{}:
 		if len(v) != 1 {
-			return pipeline.Step{}, fmt.Errorf("step %d: expected a single step type key, got %d", idx, len(v))
+			return pipeline.Step{}, nil, fmt.Errorf("step %d: expected a single step type key, got %d", idx, len(v))
 		}
 		for stepType, params := range v {
 			if stepType == "run" {
-				return parseRunStep(idx, params)
+				step, err := parseRunStep(idx, params)
+				return step, nil, err
 			}
-			return noOpStep(idx, stepType)
+			return noOpStep(jobName, idx, stepType)
 		}
 	}
-	return pipeline.Step{}, fmt.Errorf("step %d: unsupported step format", idx)
+	return pipeline.Step{}, nil, fmt.Errorf("step %d: unsupported step format", idx)
 }
 
 func parseRunStep(idx int, params interface{}) (pipeline.Step, error) {
@@ -373,19 +382,30 @@ func parseRunStep(idx int, params interface{}) (pipeline.Step, error) {
 
 // noOpStep turns an unsupported builtin step (checkout, save_cache, etc.)
 // into a visible, harmless log line rather than erroring or silently
-// dropping it — see the "Known limitations" note in CLAUDE.md.
-func noOpStep(idx int, stepType string) (pipeline.Step, error) {
-	if !noOpStepTypes[stepType] {
-		return pipeline.Step{}, fmt.Errorf("step %d: unsupported step type %q", idx, stepType)
+// dropping it — see the "Known limitations" note in CLAUDE.md — and
+// records a Finding for `polyci check` to report.
+func noOpStep(jobName string, idx int, stepType string) (pipeline.Step, *pipeline.Finding, error) {
+	level, ok := noOpStepTypes[stepType]
+	if !ok {
+		return pipeline.Step{}, nil, fmt.Errorf("step %d: unsupported step type %q", idx, stepType)
 	}
 	reason := fmt.Sprintf("step '%s' is not supported yet, skipping", stepType)
 	if stepType == "checkout" {
 		reason = "checkout is a no-op: the repo is already mounted at /workspace"
 	}
-	return pipeline.Step{
-		Name:    fmt.Sprintf("%s[%d]", stepType, idx),
+	stepName := fmt.Sprintf("%s[%d]", stepType, idx)
+	step := pipeline.Step{
+		Name:    stepName,
 		Command: fmt.Sprintf("echo \"polyci: %s\"", reason),
-	}, nil
+	}
+	finding := &pipeline.Finding{
+		Job:     jobName,
+		Step:    stepName,
+		Feature: stepType,
+		Level:   level,
+		Detail:  reason,
+	}
+	return step, finding, nil
 }
 
 // toStringMap converts an already-decoded generic map[string]interface{}

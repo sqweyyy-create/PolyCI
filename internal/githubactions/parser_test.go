@@ -3,6 +3,8 @@ package githubactions
 import (
 	"os"
 	"testing"
+
+	"github.com/sqweyyy-create/PolyCI/internal/pipeline"
 )
 
 func TestParseSimple(t *testing.T) {
@@ -164,5 +166,81 @@ jobs:
 	}
 	if byName["deploy"] != "level-1" {
 		t.Errorf("deploy stage = %q, want level-1", byName["deploy"])
+	}
+}
+
+// TestParseFindingsClassifyUsesExpressionsAndMatrix proves the features
+// this parser knowingly doesn't fully implement — third-party uses:
+// actions, unevaluated ${{ }} expressions, and strategy.matrix: — are
+// recorded as Findings for `polyci check` rather than silently passed
+// through or dropped. actions/checkout is Emulated (the workspace mount is
+// a real substitute); everything else here is Unsupported.
+func TestParseFindingsClassifyUsesExpressionsAndMatrix(t *testing.T) {
+	data := []byte(`
+jobs:
+  build:
+    container: alpine:3.19
+    strategy:
+      matrix:
+        version: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+      - run: echo "building ${{ github.sha }}"
+      - run: echo hi
+`)
+	p, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	var checkoutFinding, setupGoFinding, exprFinding, matrixFinding *pipeline.Finding
+	for i := range p.Findings {
+		f := &p.Findings[i]
+		switch {
+		case f.Feature == "actions/checkout@v4":
+			checkoutFinding = f
+		case f.Feature == "actions/setup-go@v5":
+			setupGoFinding = f
+		case f.Feature == "${{ }}":
+			exprFinding = f
+		case f.Feature == "strategy.matrix:":
+			matrixFinding = f
+		}
+	}
+
+	if checkoutFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for actions/checkout@v4", p.Findings)
+	}
+	if checkoutFinding.Job != "build" || checkoutFinding.Level != pipeline.Emulated {
+		t.Errorf("checkout finding = %+v, want Job=build Level=Emulated", checkoutFinding)
+	}
+
+	if setupGoFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for actions/setup-go@v5", p.Findings)
+	}
+	if setupGoFinding.Job != "build" || setupGoFinding.Level != pipeline.Unsupported {
+		t.Errorf("setup-go finding = %+v, want Job=build Level=Unsupported", setupGoFinding)
+	}
+
+	if exprFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for the ${{ }} expression", p.Findings)
+	}
+	if exprFinding.Job != "build" || exprFinding.Level != pipeline.Unsupported {
+		t.Errorf("expression finding = %+v, want Job=build Level=Unsupported", exprFinding)
+	}
+
+	if matrixFinding == nil {
+		t.Fatalf("Findings = %+v, want a finding for strategy.matrix:", p.Findings)
+	}
+	if matrixFinding.Job != "build" || matrixFinding.Level != pipeline.Unsupported {
+		t.Errorf("matrix finding = %+v, want Job=build Level=Unsupported", matrixFinding)
+	}
+
+	// The plain `run: echo hi` step (no expression) must not produce a finding.
+	for _, f := range p.Findings {
+		if f.Step == "run[3]" {
+			t.Errorf("unexpected finding for a plain run: step: %+v", f)
+		}
 	}
 }

@@ -9,6 +9,25 @@ document is for.
 
 **Tested against:** PolyCI `v0.2.0` (commit `3aa2fa9`), 2026-08-30.
 
+> **Update (2026-08-31):** the two `fdroidclient` divergences below —
+> `extends:` being silently ignored, and a real `pages:` job being
+> silently dropped — have since been fixed in `internal/gitlab/parser.go`.
+> `reservedTopLevelKeys` now lists only the 10 keywords that are
+> genuinely top-level in real GitLab CI (`pages` was never one of
+> them), so a job named `pages` parses like any other job. `extends:`
+> is now resolved one level deep (`variables:` deep-merged, everything
+> else child-wins), which is enough to correctly handle both of
+> `fdroidclient`'s patterns — `deploy_nightly`'s direct `extends:
+> .base`, and the anchor-merged jobs' indirect `extends:` via
+> `.test-template` (verified by `TestParseExtendsThroughAnchorMerge` in
+> `internal/gitlab/parser_test.go`, which reproduces this exact
+> pattern). A single-level-only limitation remains for chains deeper
+> than that, which `polyci check` now reports explicitly instead of
+> silently under-merging — see the new `polyci check` command in
+> [`README.md`](./README.md#checking-compatibility). The details below
+> are left as originally written to preserve the record of what was
+> found and how; they no longer reflect current behavior where noted.
+
 **Method:** for each file, only the config file itself was downloaded (not
 the full source repository, except where noted) into an empty directory,
 then `polyci plan` was run (safe, parses only, no Docker), and `polyci
@@ -31,7 +50,7 @@ Three outcomes are possible for each file:
 | Source | Outcome | Cause |
 |---|---|---|
 | [`gitlab.com/gitlab-examples/ci-debug-trace`](https://gitlab.com/gitlab-examples/ci-debug-trace/-/blob/master/.gitlab-ci.yml) | ✅ Parsed and ran | — single trivial job, no unsupported features |
-| [`gitlab.com/fdroid/fdroidclient`](https://gitlab.com/fdroid/fdroidclient/-/blob/master/.gitlab-ci.yml) | ⚠️ Parsed, diverges | `extends:` is silently ignored; a real job named `pages` is silently dropped entirely |
+| [`gitlab.com/fdroid/fdroidclient`](https://gitlab.com/fdroid/fdroidclient/-/blob/master/.gitlab-ci.yml) | ⚠️ Parsed, diverges *(both causes fixed as of 2026-08-31 — see Update note above)* | `extends:` is silently ignored; a real job named `pages` is silently dropped entirely |
 | [`gitlab.com/inkscape/inkscape`](https://gitlab.com/inkscape/inkscape/-/blob/master/.gitlab-ci.yml) | ❌ Failed to parse | Duplicate YAML mapping keys (three `if:` under one `rules:` entry) |
 | [`gitlab.com/gitlab-org/gitlab-runner`](https://gitlab.com/gitlab-org/gitlab-runner/-/blob/main/.gitlab-ci.yml) | ❌ Failed to parse | Every real job lives in `include:`d files; `include:` isn't supported |
 | [`gitlab.gnome.org/GNOME/gimp`](https://gitlab.gnome.org/GNOME/gimp/-/blob/master/.gitlab-ci.yml) | ❌ Failed to parse | Top-level `spec:`/`inputs:` (CI/CD Components) block, plus the file is multi-document YAML |
@@ -89,7 +108,8 @@ environment is provably never read, and `pages` is provably never even
 considered a job) without needing to watch a slow, resource-heavy
 failure play out.
 
-Neither gap is currently mentioned in README's Known Limitations.
+Neither gap was mentioned in README's Known Limitations at the time this
+was written; both are fixed now — see the Update note above.
 
 **`inkscape` — real YAML, strictly invalid.** `polyci plan` failed with:
 
@@ -339,7 +359,12 @@ CircleCI orb/named executors, YAML duplicate-key strictness, or GitHub
 Actions' `container:` requirement (compounded by all-or-nothing
 per-file parsing). This is not a random or vague set of gaps — the same
 short list of causes accounts for every divergence found, which is a
-reasonable starting point for prioritizing what to close first.
+reasonable starting point for prioritizing what to close first. (As of
+2026-08-31, two of these seven — `extends:` and the reserved `pages:`
+job name — are fixed; see the Update note under "Tested against"
+above. `include:` remains unimplemented, but is no longer silent: the
+parser now records it as an Unsupported finding, visible via the new
+`polyci check` command.)
 
 This report reflects one sampling pass on one day against whatever these
 repositories' default branches contained at the time — it's a snapshot,

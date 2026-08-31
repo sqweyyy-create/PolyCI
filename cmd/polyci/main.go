@@ -27,6 +27,8 @@ func main() {
 		err = runCmd(os.Args[2:])
 	case "plan":
 		err = planCmd(os.Args[2:])
+	case "check":
+		err = checkCmd(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 		return
@@ -44,6 +46,7 @@ func main() {
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "Usage: polyci run [-provider gitlab|circleci|github-actions] [-f config file] [-debug] [-shell-on-fail]")
 	fmt.Fprintln(os.Stderr, "       polyci plan [-provider gitlab|circleci|github-actions] [-f config file]")
+	fmt.Fprintln(os.Stderr, "       polyci check [-provider gitlab|circleci|github-actions] [-f config file]")
 }
 
 // providerFlags registers the -provider/-f flags shared by run and plan.
@@ -143,4 +146,23 @@ func planCmd(args []string) error {
 	}
 
 	return printPlan(os.Stdout, resolvedFile, p)
+}
+
+// checkCmd parses the given config and prints a compatibility report — how
+// much of it PolyCI fully supports, emulates, or doesn't support at all.
+// Like plan, no Docker container is created and no Docker engine connection
+// is even attempted; this never changes what `polyci run` does.
+func checkCmd(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	provider, file := providerFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	p, resolvedFile, err := resolvePipeline(*provider, *file)
+	if err != nil {
+		return err
+	}
+
+	return printCheck(os.Stdout, resolvedFile, p)
 }
